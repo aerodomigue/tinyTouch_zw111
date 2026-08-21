@@ -43,6 +43,34 @@ static const char *FP_LED_NVS_NAMESPACE = "fingerprint";
 static const char *FP_LED_MANUAL_MODE_KEY = "led_manual_mode";
 static const uint32_t FP_IMAGE_COMMAND_MAX_WAIT_MS = 1000;
 static const uint32_t FP_IMAGE_RETRY_DELAY_MS = 150;
+static const uint8_t FP_AUTO_ENROLL_COMMAND = 0x31;
+static const uint8_t FP_CANCEL_COMMAND = 0x30;
+static const uint16_t FP_AUTO_ENROLL_ALLOW_OVERWRITE = 1U << 3;
+static const uint32_t FP_ENROLL_TIMEOUT_MS = 90000;
+static const uint32_t FP_ENROLL_INITIAL_LIFT_TIMEOUT_MS = 10000;
+static const uint32_t FP_ENROLL_LIFT_SETTLE_MS = 250;
+static const uint8_t FP_RESPONSE_ACK_PACKET_ID = 0x07;
+static const uint8_t FP_CONFIRM_SUCCESS = 0x00;
+static const uint8_t FP_CONFIRM_FEATURE_FAILURE = 0x07;
+static const uint8_t FP_AUTO_ENROLL_FINAL_MERGE = 0xf0;
+static const uint8_t FP_AUTO_ENROLL_FINAL_DUPLICATE_CHECK = 0xf1;
+static const uint8_t FP_AUTO_ENROLL_FINAL_STORE = 0xf2;
+
+enum {
+  FP_ENROLL_CAPTURE_COUNT = 5,
+  FP_RESPONSE_HEADER_SIZE = 9,
+  FP_RESPONSE_BODY_CAPACITY = 32,
+};
+
+typedef enum {
+  FP_AUTO_ENROLL_STAGE_VALIDATE = 0x00,
+  FP_AUTO_ENROLL_STAGE_IMAGE = 0x01,
+  FP_AUTO_ENROLL_STAGE_FEATURE = 0x02,
+  FP_AUTO_ENROLL_STAGE_LIFT = 0x03,
+  FP_AUTO_ENROLL_STAGE_MERGE = 0x04,
+  FP_AUTO_ENROLL_STAGE_DUPLICATE_CHECK = 0x05,
+  FP_AUTO_ENROLL_STAGE_STORE = 0x06,
+} fp_auto_enroll_stage_t;
 
 typedef enum {
   FP_LED_STATE_UNKNOWN,
@@ -99,9 +127,7 @@ static uint16_t fp_checksum(uint8_t packet_id, const uint8_t *payload, size_t pa
   return (uint16_t)total;
 }
 
-static bool fp_command(uint8_t instruction, const uint8_t *params, size_t param_len,
-                       uint8_t *confirm, uint8_t *data, size_t *data_len,
-                       uint32_t timeout_ms) {
+static bool fp_send_command(uint8_t instruction, const uint8_t *params, size_t param_len) {
   uint8_t drain[64];
   while (uart_read_bytes(FP_UART, drain, sizeof(drain), 0) > 0) {}
 
@@ -117,11 +143,17 @@ static bool fp_command(uint8_t instruction, const uint8_t *params, size_t param_
     0xef, 0x01, 0xff, 0xff, 0xff, 0xff, 0x01,
     (uint8_t)(length >> 8), (uint8_t)(length & 0xff)
   };
+  const uint8_t sum_bytes[] = {(uint8_t)(sum >> 8), (uint8_t)(sum & 0xff)};
 
-  uart_write_bytes(FP_UART, header, sizeof(header));
-  uart_write_bytes(FP_UART, payload, payload_len);
-  uint8_t sum_bytes[] = {(uint8_t)(sum >> 8), (uint8_t)(sum & 0xff)};
-  uart_write_bytes(FP_UART, sum_bytes, sizeof(sum_bytes));
+  return uart_write_bytes(FP_UART, header, sizeof(header)) == (int)sizeof(header) &&
+         uart_write_bytes(FP_UART, payload, payload_len) == (int)payload_len &&
+         uart_write_bytes(FP_UART, sum_bytes, sizeof(sum_bytes)) == (int)sizeof(sum_bytes);
+}
+
+static bool fp_command(uint8_t instruction, const uint8_t *params, size_t param_len,
+                       uint8_t *confirm, uint8_t *data, size_t *data_len,
+                       uint32_t timeout_ms) {
+  if (!fp_send_command(instruction, params, param_len)) return false;
 
   uint8_t response[96];
   size_t pos = 0;
@@ -482,31 +514,183 @@ static bool wait_finger_state(bool present, uint32_t timeout_ms) {
   return false;
 }
 
-static bool capture_template(uint8_t buffer_id) {
+static bool fp_read_exact(uint8_t *output, size_t output_length, TickType_t start,
+                          TickType_t timeout_ticks) {
+  size_t output_offset = 0;
+  while (output_offset < output_length) {
+    TickType_t elapsed = xTaskGetTickCount() - start;
+    if (elapsed >= timeout_ticks) return false;
+    TickType_t remaining = timeout_ticks - elapsed;
+    int bytes_read = uart_read_bytes(FP_UART, output + output_offset,
+                                     output_length - output_offset, remaining);
+    if (bytes_read <= 0) return false;
+    output_offset += (size_t)bytes_read;
+  }
+  return true;
+}
+
+static bool fp_read_auto_enroll_response(uint8_t *confirm, uint8_t *stage,
+                                         uint8_t *capture_or_result, TickType_t start,
+                                         TickType_t timeout_ticks) {
+  uint8_t header[FP_RESPONSE_HEADER_SIZE] = {0};
+  bool saw_header_prefix = false;
+  while (true) {
+    uint8_t next_byte = 0;
+    if (!fp_read_exact(&next_byte, 1, start, timeout_ticks)) return false;
+    if (saw_header_prefix && next_byte == 0x01) {
+      header[0] = 0xef;
+      header[1] = 0x01;
+      break;
+    }
+    saw_header_prefix = next_byte == 0xef;
+  }
+
+  if (!fp_read_exact(header + 2, sizeof(header) - 2, start, timeout_ticks)) return false;
+  if (header[6] != FP_RESPONSE_ACK_PACKET_ID) return false;
+
+  uint16_t response_length = ((uint16_t)header[7] << 8) | header[8];
+  if (response_length < 5 || response_length > FP_RESPONSE_BODY_CAPACITY) return false;
+
+  uint8_t body[FP_RESPONSE_BODY_CAPACITY];
+  if (!fp_read_exact(body, response_length, start, timeout_ticks)) return false;
+
+  size_t payload_length = response_length - 2;
+  uint32_t calculated_checksum = header[6] + header[7] + header[8];
+  for (size_t index = 0; index < payload_length; index++) {
+    calculated_checksum += body[index];
+  }
+  uint16_t received_checksum = ((uint16_t)body[payload_length] << 8) |
+                               body[payload_length + 1];
+  if ((uint16_t)calculated_checksum != received_checksum || payload_length < 3) return false;
+
+  *confirm = body[0];
+  *stage = body[1];
+  *capture_or_result = body[2];
+  return true;
+}
+
+static const char *enrollment_touch_prompt(uint8_t capture_number) {
+  static const char *const prompts[FP_ENROLL_CAPTURE_COUNT] = {
+    "TOUCH_CENTER",
+    "TOUCH_LEFT_EDGE",
+    "TOUCH_RIGHT_EDGE",
+    "TOUCH_TIP",
+    "TOUCH_BASE",
+  };
+  if (capture_number == 0 || capture_number > FP_ENROLL_CAPTURE_COUNT) return NULL;
+  return prompts[capture_number - 1];
+}
+
+static void prompt_enrollment_touch(void (*prompt)(const char *message),
+                                    uint8_t capture_number) {
+  const char *message = enrollment_touch_prompt(capture_number);
+  if (prompt && message) prompt(message);
+}
+
+static void cancel_auto_enroll(void) {
   uint8_t confirm = 0xff;
-  if (!fp_command(0x01, NULL, 0, &confirm, NULL, NULL, 1500) || confirm != 0x00) return false;
-  uint8_t params[] = {buffer_id};
-  return fp_command(0x02, params, sizeof(params), &confirm, NULL, NULL, 2000) && confirm == 0x00;
+  if (!fp_command(FP_CANCEL_COMMAND, NULL, 0, &confirm, NULL, NULL, 1000) ||
+      confirm != FP_CONFIRM_SUCCESS) {
+    ESP_LOGW(TAG, "auto enroll cancel failed confirm=0x%02x", confirm);
+  }
+}
+
+static bool auto_enroll(uint16_t slot, void (*prompt)(const char *message)) {
+  const uint8_t params[] = {
+    (uint8_t)(slot >> 8),
+    (uint8_t)slot,
+    FP_ENROLL_CAPTURE_COUNT,
+    (uint8_t)(FP_AUTO_ENROLL_ALLOW_OVERWRITE >> 8),
+    (uint8_t)FP_AUTO_ENROLL_ALLOW_OVERWRITE,
+  };
+  if (!fp_send_command(FP_AUTO_ENROLL_COMMAND, params, sizeof(params))) return false;
+
+  TickType_t start = xTaskGetTickCount();
+  TickType_t timeout_ticks = pdMS_TO_TICKS(FP_ENROLL_TIMEOUT_MS);
+  while ((xTaskGetTickCount() - start) < timeout_ticks) {
+    uint8_t confirm = 0xff;
+    uint8_t stage_value = 0xff;
+    uint8_t capture_or_result = 0xff;
+    if (!fp_read_auto_enroll_response(&confirm, &stage_value, &capture_or_result,
+                                      start, timeout_ticks)) {
+      ESP_LOGW(TAG, "auto enroll response timed out or was invalid");
+      cancel_auto_enroll();
+      return false;
+    }
+
+    fp_auto_enroll_stage_t stage = (fp_auto_enroll_stage_t)stage_value;
+    ESP_LOGI(TAG, "auto enroll confirm=0x%02x stage=0x%02x value=0x%02x",
+             confirm, stage_value, capture_or_result);
+
+    if (stage == FP_AUTO_ENROLL_STAGE_FEATURE &&
+        confirm == FP_CONFIRM_FEATURE_FAILURE) {
+      if (prompt) prompt("RETRY_CAPTURE");
+      prompt_enrollment_touch(prompt, capture_or_result);
+      continue;
+    }
+    if (confirm != FP_CONFIRM_SUCCESS) {
+      cancel_auto_enroll();
+      return false;
+    }
+
+    switch (stage) {
+      case FP_AUTO_ENROLL_STAGE_VALIDATE:
+        prompt_enrollment_touch(prompt, 1);
+        break;
+      case FP_AUTO_ENROLL_STAGE_IMAGE:
+        break;
+      case FP_AUTO_ENROLL_STAGE_FEATURE:
+        if (capture_or_result == 0 || capture_or_result > FP_ENROLL_CAPTURE_COUNT) {
+          cancel_auto_enroll();
+          return false;
+        }
+        if (capture_or_result < FP_ENROLL_CAPTURE_COUNT && prompt) prompt("LIFT");
+        break;
+      case FP_AUTO_ENROLL_STAGE_LIFT:
+        if (capture_or_result == 0 || capture_or_result >= FP_ENROLL_CAPTURE_COUNT) {
+          cancel_auto_enroll();
+          return false;
+        }
+        prompt_enrollment_touch(prompt, capture_or_result + 1);
+        break;
+      case FP_AUTO_ENROLL_STAGE_MERGE:
+        if (capture_or_result != FP_AUTO_ENROLL_FINAL_MERGE) {
+          cancel_auto_enroll();
+          return false;
+        }
+        break;
+      case FP_AUTO_ENROLL_STAGE_DUPLICATE_CHECK:
+        if (capture_or_result != FP_AUTO_ENROLL_FINAL_DUPLICATE_CHECK) {
+          cancel_auto_enroll();
+          return false;
+        }
+        break;
+      case FP_AUTO_ENROLL_STAGE_STORE:
+        return capture_or_result == FP_AUTO_ENROLL_FINAL_STORE;
+      default:
+        cancel_auto_enroll();
+        return false;
+    }
+  }
+
+  cancel_auto_enroll();
+  return false;
 }
 
 bool fingerprint_enroll(uint16_t slot, void (*prompt)(const char *message)) {
   if (slot < START_SLOT || slot > END_SLOT || !fp_take(1000)) return false;
-  bool ok = false;
   led_apply(FP_LED_STATE_PROMPT);
-  if (prompt) prompt("TOUCH");
-  if (!wait_finger_state(true, 15000) || !capture_template(1)) goto done;
-  if (prompt) prompt("LIFT");
-  if (!wait_finger_state(false, 10000)) goto done;
-  vTaskDelay(pdMS_TO_TICKS(250));
-  if (prompt) prompt("TOUCH_AGAIN");
-  if (!wait_finger_state(true, 15000) || !capture_template(2)) goto done;
+  if (finger_present()) {
+    if (prompt) prompt("LIFT");
+    if (!wait_finger_state(false, FP_ENROLL_INITIAL_LIFT_TIMEOUT_MS)) {
+      show_result(false);
+      fp_give();
+      return false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(FP_ENROLL_LIFT_SETTLE_MS));
+  }
 
-  uint8_t confirm = 0xff;
-  if (!fp_command(0x05, NULL, 0, &confirm, NULL, NULL, 2000) || confirm != 0x00) goto done;
-  uint8_t store[] = {0x01, (uint8_t)(slot >> 8), (uint8_t)slot};
-  ok = fp_command(0x06, store, sizeof(store), &confirm, NULL, NULL, 2000) && confirm == 0x00;
-
-done:
+  bool ok = auto_enroll(slot, prompt);
   show_result(ok);
   fp_give();
   return ok;

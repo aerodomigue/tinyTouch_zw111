@@ -44,6 +44,7 @@ CLI_INSTALL_PATH = CLI_INSTALL_DIR / "tinytouch"
 VERBOSE = False
 HELPER_SUSPENDED = False
 FACTORY_FLASH_URL = "https://alpacaengineer.ing/tinytouch/batch-0/flash/"
+FINGERPRINT_ENROLL_TIMEOUT_SECONDS = 105.0
 
 
 class ToolError(RuntimeError):
@@ -219,6 +220,12 @@ def show_device_line(line: str) -> None:
         "PROMPT TOUCH": "Touch the fingerprint sensor now.",
         "PROMPT LIFT": "Lift your finger from the sensor.",
         "PROMPT TOUCH_AGAIN": "Place the same finger on the sensor again.",
+        "PROMPT TOUCH_CENTER": "Place the center of the finger on the sensor.",
+        "PROMPT TOUCH_LEFT_EDGE": "Place the left edge of the same finger on the sensor.",
+        "PROMPT TOUCH_RIGHT_EDGE": "Place the right edge of the same finger on the sensor.",
+        "PROMPT TOUCH_TIP": "Place the fingertip on the sensor.",
+        "PROMPT TOUCH_BASE": "Place the lower edge of the same finger on the sensor.",
+        "PROMPT RETRY_CAPTURE": "Lift and adjust the same finger before trying that area again.",
     }
     if line in prompts:
         say(f"  → {prompts[line]}")
@@ -1037,7 +1044,7 @@ def configure_unified_device(
             say(f"  ✓ Preserving {fingerprint_count} enrolled fingerprint(s).")
         else:
             say("Enroll your first fingerprint.")
-            serial_command(port, "ENROLL 1", timeout=45)
+            serial_command(port, "ENROLL 1", timeout=FINGERPRINT_ENROLL_TIMEOUT_SECONDS)
             say("  ✓ Fingerprint enrolled in slot 1.")
     else:
         say("Fingerprint enrollment was skipped as requested.")
@@ -1129,7 +1136,7 @@ def command_add_computer(args: argparse.Namespace) -> None:
         if not configuration_unlocked:
             unlock_configuration(port)
         say("Enroll your first fingerprint.")
-        serial_command(port, "ENROLL 1", timeout=45)
+        serial_command(port, "ENROLL 1", timeout=FINGERPRINT_ENROLL_TIMEOUT_SECONDS)
         say("  ✓ Fingerprint enrolled in slot 1.")
     else:
         say(f"  ✓ Preserving {fingerprint_count} enrolled fingerprint(s).")
@@ -1283,7 +1290,7 @@ def command_enroll(args: argparse.Namespace) -> None:
     require_fingerprint_sensor(status)
     unlock_configuration(port)
     say("Follow each sensor instruction below.")
-    serial_command(port, f"ENROLL {args.slot}", timeout=45)
+    serial_command(port, f"ENROLL {args.slot}", timeout=FINGERPRINT_ENROLL_TIMEOUT_SECONDS)
     say(f"  ✓ Fingerprint enrolled in slot {args.slot}.")
 
 

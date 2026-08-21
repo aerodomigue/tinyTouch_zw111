@@ -167,6 +167,36 @@ class PackagingTests(unittest.TestCase):
                 )
         self.assertIn("preserves the existing key", str(context.exception))
 
+    def test_guided_enrollment_prompts_name_each_finger_area(self):
+        prompts = {
+            "PROMPT TOUCH_CENTER": "Place the center of the finger on the sensor.",
+            "PROMPT TOUCH_LEFT_EDGE": "Place the left edge of the same finger on the sensor.",
+            "PROMPT TOUCH_RIGHT_EDGE": "Place the right edge of the same finger on the sensor.",
+            "PROMPT TOUCH_TIP": "Place the fingertip on the sensor.",
+            "PROMPT TOUCH_BASE": "Place the lower edge of the same finger on the sensor.",
+        }
+        with mock.patch.object(cli, "say") as output:
+            for device_prompt, expected_message in prompts.items():
+                with self.subTest(device_prompt=device_prompt):
+                    output.reset_mock()
+                    cli.show_device_line(device_prompt)
+                    output.assert_called_once_with(f"  → {expected_message}")
+
+    def test_enroll_uses_multi_capture_timeout(self):
+        args = cli.parser().parse_args(["enroll", "--slot", "3"])
+        status = {"firmware": "unified", "sensor": "ok"}
+        with (
+            mock.patch.object(cli, "choose_port", return_value="/dev/cu.example"),
+            mock.patch.object(cli, "status_fields", return_value=status),
+            mock.patch.object(cli, "unlock_configuration"),
+            mock.patch.object(cli, "serial_command") as serial_command,
+            mock.patch.object(cli, "say"),
+        ):
+            cli.command_enroll(args)
+        serial_command.assert_called_once_with(
+            "/dev/cu.example", "ENROLL 3", timeout=cli.FINGERPRINT_ENROLL_TIMEOUT_SECONDS
+        )
+
 
 class ParserTests(unittest.TestCase):
     def test_setup_mode(self):

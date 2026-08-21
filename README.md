@@ -29,6 +29,7 @@ if you would like to support this project, please consider [donating](https://gi
   - [red pill](#red-pill)
   - [blue pill](#blue-pill)
 - [LED feedback](#led-feedback)
+- [fingerprint enrollment](#fingerprint-enrollment)
 - [hardware](#hardware)
 - [wiring](#wiring)
 - [notes](#notes)
@@ -161,6 +162,16 @@ After a result, tinyTouch returns to idle. An interactive request also returns
 to idle after seven seconds without an image. macOS does not expose a direct
 notification when its authentication popup is cancelled, so this timeout is the
 fallback for a cancelled or abandoned request.
+
+## fingerprint enrollment
+
+Fingerprint enrollment captures the center and four edges of the same finger,
+with a full lift between each capture. The ZW111 merges the five samples into a
+single template in the selected slot. Run `tinytouch enroll --slot 1` and follow
+the terminal instructions. Existing templates are not upgraded automatically.
+
+See [guided fingerprint enrollment](docs/fingerprint-enrollment.md) for the
+capture sequence, timeouts, replacement behavior, and protocol details.
 
 ## install
 
