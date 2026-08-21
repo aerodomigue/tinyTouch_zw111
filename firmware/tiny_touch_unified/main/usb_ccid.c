@@ -6,6 +6,7 @@
 #include "tinyusb.h"
 #include "tinyusb_default_config.h"
 #include "tusb.h"
+#include "device/dcd.h"
 #include "device/usbd_pvt.h"
 #include "usb_descriptors.h"
 
@@ -19,7 +20,6 @@ static uint8_t rx_buf[CCID_BUF_SIZE];
 static uint8_t tx_buf[CCID_BUF_SIZE];
 static uint8_t rhport_active;
 static ccid_apdu_handler_t apdu_handler;
-static bool ep_ready;
 
 static uint32_t le32(const uint8_t *p) {
   return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
@@ -100,7 +100,6 @@ static void handle_message(uint8_t *msg, size_t msg_len) {
 static void ccid_init(void) {}
 static void ccid_reset(uint8_t rhport) {
   (void)rhport;
-  ep_ready = false;
 }
 
 static uint16_t ccid_open(uint8_t rhport, tusb_desc_interface_t const *itf_desc,
@@ -116,7 +115,6 @@ static uint16_t ccid_open(uint8_t rhport, tusb_desc_interface_t const *itf_desc,
       !usbd_edpt_open(rhport, ep_in)) return 0;
 
   rhport_active = rhport;
-  ep_ready = true;
   usbd_edpt_xfer(rhport, CCID_EP_OUT, rx_buf, sizeof(rx_buf));
   return drv_len + 2 * sizeof(tusb_desc_endpoint_t);
 }
@@ -128,9 +126,19 @@ static bool ccid_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_req
   return false;
 }
 
+static void sync_resume_from_host_traffic(uint8_t rhport) {
+  if (tud_suspended()) {
+    // A completed USB transfer proves that the host bus is active. DWC2 can
+    // miss its wake-up interrupt, leaving TinyUSB's software state suspended
+    // and blocking the built-in HID and CDC drivers through tud_ready().
+    dcd_event_bus_signal(rhport, DCD_EVENT_RESUME, false);
+  }
+}
+
 static bool ccid_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result,
                          uint32_t xferred_bytes) {
   if (result != XFER_RESULT_SUCCESS) return true;
+  sync_resume_from_host_traffic(rhport);
   if (ep_addr == CCID_EP_OUT) {
     handle_message(rx_buf, xferred_bytes);
     usbd_edpt_xfer(rhport, CCID_EP_OUT, rx_buf, sizeof(rx_buf));
@@ -164,9 +172,4 @@ void usb_ccid_start(ccid_apdu_handler_t handler) {
   tusb_cfg.descriptor.string_count = tiny_touch_string_descriptor_count;
   tusb_cfg.descriptor.full_speed_config = tiny_touch_fs_configuration_descriptor;
   ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
-}
-
-void usb_ccid_task(void) {
-  (void)ep_ready;
-  tud_task();
 }

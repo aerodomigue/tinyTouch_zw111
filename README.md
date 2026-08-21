@@ -135,6 +135,9 @@ gate around the piv key.
 this avoids typing your real password, but only works where macos accepts smart
 cards, like login and `sudo` with pam.
 
+For details about the ESP32-S3 USB sleep/wake failure and its native TinyUSB
+recovery path, see [USB suspend and resume recovery](docs/usb-suspend-resume.md).
+
 ## LED feedback
 
 tinyTouch controls the Hi-Link ZW111 LED with its multi-function `0x3C` command.
