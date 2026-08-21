@@ -28,6 +28,7 @@ if you would like to support this project, please consider [donating](https://gi
 - [install](#install)
   - [red pill](#red-pill)
   - [blue pill](#blue-pill)
+- [LED feedback](#led-feedback)
 - [hardware](#hardware)
 - [wiring](#wiring)
 - [notes](#notes)
@@ -133,6 +134,30 @@ gate around the piv key.
 
 this avoids typing your real password, but only works where macos accepts smart
 cards, like login and `sudo` with pam.
+
+## LED feedback
+
+tinyTouch controls the Hi-Link ZW111 LED with its multi-function `0x3C` command.
+Each state transition is sent once; the sensor performs the effect itself, so
+there is no host-side animation loop.
+
+On the first boot with this firmware, tinyTouch provisions the ZW111's
+persistent manual LED mode. Disconnect and reconnect USB once after the log
+message requests it, ensuring the ZW111's VCC actually falls to 0 V: an ESP32
+reset alone is insufficient. This changes only the sensor LED mode; it does not erase
+fingerprint templates, PIV keys, or other device configuration.
+
+| state | color and effect |
+| --- | --- |
+| idle / sleep | blue breathing, 10-second period |
+| interactive fingerprint request | yellow breathing, 1-second period |
+| fingerprint rejected | two red flashes, 0.5 seconds each |
+| fingerprint accepted | two green flashes, 0.5 seconds each |
+
+After a result, tinyTouch returns to idle. An interactive request also returns
+to idle after seven seconds without an image. macOS does not expose a direct
+notification when its authentication popup is cancelled, so this timeout is the
+fallback for a cancelled or abandoned request.
 
 ## install
 

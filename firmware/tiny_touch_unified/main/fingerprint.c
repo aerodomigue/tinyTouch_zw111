@@ -8,6 +8,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "nvs.h"
 
 static const char *TAG = "fingerprint";
 
@@ -18,14 +19,77 @@ static const int FP_INT_PIN = 2;
 static const int INT_ACTIVE_VALUE = 1;
 static const uint16_t START_SLOT = 1;
 static const uint16_t END_SLOT = 5;
+// This timeout returns the LED to idle when an interactive request is abandoned.
+// macOS does not send tinyTouch a dedicated popup-cancel event.
 static const uint32_t FINGER_WAIT_MS = 7000;
 static const uint8_t FP_LED_BLUE = 0x01;
 static const uint8_t FP_LED_GREEN = 0x02;
 static const uint8_t FP_LED_RED = 0x04;
-static const uint8_t FP_LED_FUNC_FLASH = 2;
-static const uint8_t FP_LED_FUNC_STEADY = 3;
+static const uint8_t FP_LED_YELLOW = 0x06;
+static const uint8_t FP_LED_AURA_COMMAND = 0x3c;
+static const uint8_t FP_LED_CONTROL_MODE_COMMAND = 0x60;
+static const uint8_t FP_LED_MANUAL_CONTROL_MODE = 0x00;
+static const uint8_t FP_LED_MANUAL_CONTROL_MODE_CONFIGURED = 0x01;
+static const uint8_t FP_LED_FUNC_BREATHING = 0x01;
+static const uint8_t FP_LED_FUNC_FLASH = 0x02;
+static const uint8_t FP_LED_CYCLES_FOREVER = 0;
+static const uint8_t FP_LED_FLASH_COUNT = 2;
+static const uint8_t FP_LED_FLASH_DUTY_HALF = 0x11;
+static const uint8_t FP_LED_IDLE_PERIOD_TENTHS = 100;
+static const uint8_t FP_LED_PROMPT_PERIOD_TENTHS = 10;
+static const uint8_t FP_LED_FLASH_PERIOD_TENTHS = 5;
+static const uint32_t FP_LED_TENTH_SECOND_MS = 100;
+static const char *FP_LED_NVS_NAMESPACE = "fingerprint";
+static const char *FP_LED_MANUAL_MODE_KEY = "led_manual_mode";
+static const uint32_t FP_IMAGE_COMMAND_MAX_WAIT_MS = 1000;
+static const uint32_t FP_IMAGE_RETRY_DELAY_MS = 150;
 
-static uint8_t current_led = 0xff;
+typedef enum {
+  FP_LED_STATE_UNKNOWN,
+  FP_LED_STATE_IDLE,
+  FP_LED_STATE_PROMPT,
+  FP_LED_STATE_REJECTED,
+  FP_LED_STATE_ACCEPTED,
+} fp_led_state_t;
+
+typedef struct {
+  uint8_t function;
+  uint8_t start_color;
+  uint8_t end_color_or_duty;
+  uint8_t cycles;
+  uint8_t period_tenths;
+} fp_led_command_t;
+
+static const fp_led_command_t FP_LED_IDLE_COMMAND = {
+  .function = FP_LED_FUNC_BREATHING,
+  .start_color = FP_LED_BLUE,
+  .end_color_or_duty = FP_LED_BLUE,
+  .cycles = FP_LED_CYCLES_FOREVER,
+  .period_tenths = FP_LED_IDLE_PERIOD_TENTHS,
+};
+static const fp_led_command_t FP_LED_PROMPT_COMMAND = {
+  .function = FP_LED_FUNC_BREATHING,
+  .start_color = FP_LED_YELLOW,
+  .end_color_or_duty = FP_LED_YELLOW,
+  .cycles = FP_LED_CYCLES_FOREVER,
+  .period_tenths = FP_LED_PROMPT_PERIOD_TENTHS,
+};
+static const fp_led_command_t FP_LED_REJECTED_COMMAND = {
+  .function = FP_LED_FUNC_FLASH,
+  .start_color = FP_LED_RED,
+  .end_color_or_duty = FP_LED_FLASH_DUTY_HALF,
+  .cycles = FP_LED_FLASH_COUNT,
+  .period_tenths = FP_LED_FLASH_PERIOD_TENTHS,
+};
+static const fp_led_command_t FP_LED_ACCEPTED_COMMAND = {
+  .function = FP_LED_FUNC_FLASH,
+  .start_color = FP_LED_GREEN,
+  .end_color_or_duty = FP_LED_FLASH_DUTY_HALF,
+  .cycles = FP_LED_FLASH_COUNT,
+  .period_tenths = FP_LED_FLASH_PERIOD_TENTHS,
+};
+
+static fp_led_state_t led_state = FP_LED_STATE_UNKNOWN;
 static SemaphoreHandle_t fp_mutex;
 
 static uint16_t fp_checksum(uint8_t packet_id, const uint8_t *payload, size_t payload_len) {
@@ -128,30 +192,104 @@ static void fp_give(void) {
   if (fp_mutex) xSemaphoreGive(fp_mutex);
 }
 
-static void set_aura(uint8_t color) {
-  if (color == current_led) return;
-  uint8_t params[] = {FP_LED_FUNC_STEADY, color, color, 0};
-  uint8_t confirm = 0xff;
-  fp_command(0x3c, params, sizeof(params), &confirm, NULL, NULL, 1000);
-  current_led = color;
+static bool led_manual_mode_provisioned(void) {
+  nvs_handle_t handle;
+  if (nvs_open(FP_LED_NVS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK) return false;
+
+  uint8_t configured = 0;
+  esp_err_t result = nvs_get_u8(handle, FP_LED_MANUAL_MODE_KEY, &configured);
+  nvs_close(handle);
+  return result == ESP_OK && configured == FP_LED_MANUAL_CONTROL_MODE_CONFIGURED;
 }
 
-static void flash_aura(uint8_t color) {
-  uint8_t params[] = {FP_LED_FUNC_FLASH, 40, color, 2};
+// The fingerprint mutex must be held by the caller for the whole UART exchange.
+static bool configure_led_manual_mode(void) {
+  nvs_handle_t handle;
+  esp_err_t result = nvs_open(FP_LED_NVS_NAMESPACE, NVS_READWRITE, &handle);
+  if (result != ESP_OK) {
+    ESP_LOGE(TAG, "could not prepare manual LED mode err=%s", esp_err_to_name(result));
+    return false;
+  }
+
+  const uint8_t params[] = {FP_LED_MANUAL_CONTROL_MODE};
   uint8_t confirm = 0xff;
-  fp_command(0x3c, params, sizeof(params), &confirm, NULL, NULL, 1000);
-  current_led = 0xff;
+  if (!fp_command(FP_LED_CONTROL_MODE_COMMAND, params, sizeof(params), &confirm, NULL, NULL,
+                  1000) || confirm != 0x00) {
+    nvs_close(handle);
+    ESP_LOGW(TAG, "manual LED mode rejected confirm=0x%02x", confirm);
+    return false;
+  }
+
+  result = nvs_set_u8(handle, FP_LED_MANUAL_MODE_KEY, FP_LED_MANUAL_CONTROL_MODE_CONFIGURED);
+  if (result == ESP_OK) result = nvs_commit(handle);
+  nvs_close(handle);
+  if (result != ESP_OK) {
+    ESP_LOGE(TAG, "could not record manual LED mode err=%s; LED effects remain disabled",
+             esp_err_to_name(result));
+    return false;
+  }
+
+  ESP_LOGW(TAG, "manual LED mode configured; power-cycle the ZW111 before using LED effects");
+  return true;
+}
+
+static const fp_led_command_t *led_command_for_state(fp_led_state_t state) {
+  switch (state) {
+    case FP_LED_STATE_IDLE:
+      return &FP_LED_IDLE_COMMAND;
+    case FP_LED_STATE_PROMPT:
+      return &FP_LED_PROMPT_COMMAND;
+    case FP_LED_STATE_REJECTED:
+      return &FP_LED_REJECTED_COMMAND;
+    case FP_LED_STATE_ACCEPTED:
+      return &FP_LED_ACCEPTED_COMMAND;
+    case FP_LED_STATE_UNKNOWN:
+    default:
+      return NULL;
+  }
+}
+
+static uint32_t led_command_duration_ms(const fp_led_command_t *command) {
+  return (uint32_t)command->cycles * command->period_tenths * FP_LED_TENTH_SECOND_MS;
+}
+
+// The fingerprint mutex must be held by the caller for the whole UART exchange.
+static bool led_apply(fp_led_state_t state) {
+  if (state == led_state) return true;
+
+  const fp_led_command_t *command = led_command_for_state(state);
+  if (command == NULL) return false;
+  const uint8_t params[] = {
+    command->function,
+    command->start_color,
+    command->end_color_or_duty,
+    command->cycles,
+    command->period_tenths,
+  };
+  uint8_t confirm = 0xff;
+  bool ok = fp_command(FP_LED_AURA_COMMAND, params, sizeof(params), &confirm, NULL, NULL,
+                       1000) && confirm == 0x00;
+  if (!ok) {
+    ESP_LOGW(TAG, "LED state %d rejected confirm=0x%02x", state, confirm);
+    return false;
+  }
+
+  led_state = state;
+  return true;
 }
 
 static void show_result(bool ok) {
-  flash_aura(ok ? FP_LED_GREEN : FP_LED_RED);
-  vTaskDelay(pdMS_TO_TICKS(350));
-  set_aura(FP_LED_BLUE);
+  fp_led_state_t result_state = ok ? FP_LED_STATE_ACCEPTED : FP_LED_STATE_REJECTED;
+  const fp_led_command_t *command = led_command_for_state(result_state);
+  if (led_apply(result_state)) {
+    vTaskDelay(pdMS_TO_TICKS(led_command_duration_ms(command)));
+  }
+  led_apply(FP_LED_STATE_IDLE);
 }
 
 void fingerprint_led_idle(void) {
   if (!fp_take(1000)) return;
-  set_aura(FP_LED_BLUE);
+  led_apply(FP_LED_STATE_IDLE);
   fp_give();
 }
 
@@ -169,8 +307,8 @@ static bool fingerprint_match_captured(bool quiet) {
   if (!fp_command(0x02, img2tz, sizeof(img2tz), &confirm, NULL, NULL, 2000) || confirm != 0x00) {
     if (!quiet) {
       ESP_LOGW(TAG, "img2tz failed confirm=0x%02x", confirm);
-      show_result(false);
     }
+    show_result(false);
     return false;
   }
 
@@ -188,7 +326,7 @@ static bool fingerprint_match_captured(bool quiet) {
     uint16_t score = ((uint16_t)search_data[2] << 8) | search_data[3];
     bool ok = score > 0;
     ESP_LOGI(TAG, "fingerprint search: %s score=%u", ok ? "ok" : "failed", score);
-    if (!quiet || ok) show_result(ok);
+    show_result(ok);
     return ok;
   } else if (!quiet) {
     ESP_LOGW(TAG, "search failed confirm=0x%02x len=%u", confirm, (unsigned)search_len);
@@ -223,7 +361,7 @@ static bool fingerprint_match_captured(bool quiet) {
     }
   }
 
-  if (!quiet) show_result(false);
+  show_result(false);
   return false;
 }
 
@@ -261,35 +399,59 @@ void fingerprint_init(void) {
   uart_param_config(FP_UART, &cfg);
   uart_set_pin(FP_UART, FP_TX_PIN, FP_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
   fp_mutex = xSemaphoreCreateMutex();
+  if (fp_mutex == NULL) {
+    ESP_LOGE(TAG, "could not create fingerprint mutex");
+    return;
+  }
 
   uint8_t params[] = {0x00, 0x00, 0x00, 0x00};
   uint8_t confirm = 0xff;
   fp_take(2000);
   bool ok = fp_command(0x13, params, sizeof(params), &confirm, NULL, NULL, 2000) && confirm == 0x00;
+  bool manual_mode_already_configured = led_manual_mode_provisioned();
+  bool manual_mode_configured = ok &&
+                                (manual_mode_already_configured || configure_led_manual_mode());
   fp_give();
   ESP_LOGI(TAG, "sensor verify: %s", ok ? "ok" : "failed");
-  fingerprint_led_idle();
+  if (ok && manual_mode_already_configured) {
+    fingerprint_led_idle();
+  } else if (manual_mode_configured) {
+    ESP_LOGW(TAG, "LED effects will start after the required ZW111 power cycle");
+  }
 }
 
 bool fingerprint_authorize_once(void) {
   if (!fp_take(FINGER_WAIT_MS + 1000)) return false;
   uint8_t confirm = 0xff;
   ESP_LOGI(TAG, "finger present hint=%d", finger_present());
-  set_aura(FP_LED_BLUE);
+  led_apply(FP_LED_STATE_PROMPT);
 
   TickType_t start = xTaskGetTickCount();
   TickType_t deadline = pdMS_TO_TICKS(FINGER_WAIT_MS);
   bool got_image = false;
   while ((xTaskGetTickCount() - start) < deadline) {
-    if (fp_command(0x01, NULL, 0, &confirm, NULL, NULL, 1000) && confirm == 0x00) {
+    TickType_t elapsed = xTaskGetTickCount() - start;
+    TickType_t remaining = deadline - elapsed;
+    uint32_t remaining_ms = pdTICKS_TO_MS(remaining);
+    if (remaining_ms == 0) break;
+    uint32_t command_timeout_ms = remaining_ms < FP_IMAGE_COMMAND_MAX_WAIT_MS
+                                    ? remaining_ms
+                                    : FP_IMAGE_COMMAND_MAX_WAIT_MS;
+    if (fp_command(0x01, NULL, 0, &confirm, NULL, NULL, command_timeout_ms) &&
+        confirm == 0x00) {
       got_image = true;
       break;
     }
-    vTaskDelay(pdMS_TO_TICKS(150));
+    elapsed = xTaskGetTickCount() - start;
+    if (elapsed >= deadline) break;
+    remaining = deadline - elapsed;
+    TickType_t retry_delay = pdMS_TO_TICKS(FP_IMAGE_RETRY_DELAY_MS);
+    vTaskDelay(remaining < retry_delay ? remaining : retry_delay);
   }
   if (!got_image) {
     ESP_LOGW(TAG, "gen image failed confirm=0x%02x", confirm);
-    show_result(false);
+    // No image means an abandoned request, not a rejected fingerprint.
+    led_apply(FP_LED_STATE_IDLE);
     fp_give();
     return false;
   }
@@ -330,7 +492,7 @@ static bool capture_template(uint8_t buffer_id) {
 bool fingerprint_enroll(uint16_t slot, void (*prompt)(const char *message)) {
   if (slot < START_SLOT || slot > END_SLOT || !fp_take(1000)) return false;
   bool ok = false;
-  set_aura(FP_LED_BLUE);
+  led_apply(FP_LED_STATE_PROMPT);
   if (prompt) prompt("TOUCH");
   if (!wait_finger_state(true, 15000) || !capture_template(1)) goto done;
   if (prompt) prompt("LIFT");
