@@ -82,12 +82,42 @@ lock, carrying a `kLWLockFrom...` reason instead. Matching on
 `kLWUnlockFromUserActive` discriminates them; over 90 minutes it produced five
 occurrences, all real.
 
-So four markers cover every measured case: `startScreenLock` when the screen
-locks, `kLWUnlockFromUserActive` when the user returns to a locked screen,
+In the end `startScreenLock` is not what the watcher matches on. `loginwindow`
+posts a distributed notification alongside it, and logs the fact:
+
+```
+-[SessionAgentNotificationCenter sendDistributedNotification:object:]
+  | sendDistributedNotification: com.apple.screenIsLocked, with object:501
+```
+
+`com.apple.screenIsLocked` is a public notification name that plenty of software
+already depends on, so it is far less likely to be renamed than a private
+`-[LWScreenLock ...]` method. Over three hours the two matched one for one, nine
+occurrences each, so the public name wins.
+
+Four markers therefore raise the prompt: `com.apple.screenIsLocked` when the
+screen locks, `kLWUnlockFromUserActive` when the user returns to a locked screen,
 `Checked in app : SecurityAgent` for authorization dialogs, and
 `Invoking SmartCard agent` for `sudo`.
 
-A fifth marker closes the loop in the other direction. `loginwindow` logs
+### Clearing the prompt when something else authenticates
+
+`Token login result` only exists when the PIV card did the work. Unlock the Mac
+with an Apple Watch, Touch ID or a typed password and CryptoTokenKit is never
+involved, so nothing told the watcher the prompt was over and the LED stayed
+yellow until the firmware hold ran out.
+
+The counterpart notification fixes it for every method at once:
+
+```
+sendDistributedNotification: com.apple.screenIsUnlocked, with object:501
+```
+
+It is posted whatever unlocked the screen, exactly once per unlock, and pairs
+with `com.apple.screenIsLocked`. The card path emits both it and
+`Token login result`; the result cooldown keeps that from bouncing the LED.
+
+One more marker closes the loop in the other direction. `loginwindow` logs
 SkyLight's `[ Display:Power ] Event: Did Sleep` when the display goes dark, which
 means nobody is standing there any more. Acting on it returns the LED to idle
 immediately instead of waiting out the firmware hold, and lets the LED follow the

@@ -81,7 +81,18 @@ SUDO_PROMPT_MARKER = "Invoking SmartCard agent for uid"
 # LWScreenLock. SecurityAgent check-in covers authorization dialogs.
 # `startScreenLock:` alone logs about fifteen progress lines per lock; the
 # `| entered` suffix isolates the single line that opens the sequence.
-SCREEN_LOCK_MARKER = "startScreenLock:] | entered"
+# loginwindow posts these two as distributed notifications. They are public
+# names that plenty of software already relies on, so they are a safer bet than
+# the private `-[LWScreenLock ...]` methods that log alongside them, and over
+# three hours they matched those methods one for one.
+SCREEN_LOCK_MARKER = "com.apple.screenIsLocked"
+
+# The unlock notification is posted whatever unlocked the screen: the PIV card,
+# a typed password, Touch ID or an Apple Watch. CryptoTokenKit's `Token login
+# result` only covers the card, so without this an Apple Watch unlock left the
+# LED yellow until the firmware hold ran out.
+SCREEN_UNLOCK_MARKER = "com.apple.screenIsUnlocked"
+
 SECURITY_AGENT_MARKER = "Checked in app : SecurityAgent"
 
 # `startScreenLock` only fires when the screen locks. Someone who locks their
@@ -120,6 +131,7 @@ PREDICATE = (
     f'eventMessage CONTAINS "{CARD_INSERTED_MARKER}")) OR '
     f'(process == "{LOGIN_PROCESS}" AND ('
     f'eventMessage CONTAINS "{SCREEN_LOCK_MARKER}" OR '
+    f'eventMessage CONTAINS "{SCREEN_UNLOCK_MARKER}" OR '
     f'eventMessage CONTAINS "{SCREEN_WAKE_MARKER}" OR '
     f'eventMessage CONTAINS "{DISPLAY_SLEEP_MARKER}" OR '
     f'eventMessage CONTAINS "{SECURITY_AGENT_MARKER}"))'
@@ -130,6 +142,7 @@ class EventKind(Enum):
     """Kinds of authentication event recognised in the unified log."""
 
     PROMPT_OPENED = "prompt_opened"
+    AUTHENTICATED = "authenticated"
     DISPLAY_OFF = "display_off"
     PIN_SUBMITTED = "pin_submitted"
     RESULT = "result"
@@ -259,6 +272,8 @@ def parse_log_line(line: str) -> PromptEvent | None:
         return PromptEvent(EventKind.CARD_INSERTED, "card")
     if process == CTK_PROCESS and SUDO_PROMPT_MARKER in message:
         return PromptEvent(EventKind.PROMPT_OPENED, "pam_smartcard")
+    if process == LOGIN_PROCESS and SCREEN_UNLOCK_MARKER in message:
+        return PromptEvent(EventKind.AUTHENTICATED, "screen_unlocked")
     if process == LOGIN_PROCESS and SCREEN_LOCK_MARKER in message:
         return PromptEvent(EventKind.PROMPT_OPENED, "screen_lock")
     if process == LOGIN_PROCESS and SCREEN_WAKE_MARKER in message:
@@ -450,9 +465,19 @@ class PromptWatcher:
             self._cancel_pending()
             return
 
+        if event.kind is EventKind.AUTHENTICATED:
+            # Whatever unlocked the screen, the prompt is over.
+            LOGGER.info("screen unlocked")
+            self._cancel_pending()
+            self._prompt_missed_at = 0.0
+            self._cooldown_until = time.monotonic() + RESULT_COOLDOWN_SECONDS
+            self._leds.send(IDLE_COMMAND)
+            return
+
         if event.kind is EventKind.RESULT:
             LOGGER.info("authentication result %s", event.result_code)
             self._cancel_pending()
+            self._prompt_missed_at = 0.0
             self._cooldown_until = time.monotonic() + RESULT_COOLDOWN_SECONDS
             self._leds.send(IDLE_COMMAND)
             return
