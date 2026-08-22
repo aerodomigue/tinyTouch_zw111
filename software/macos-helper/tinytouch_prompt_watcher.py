@@ -72,6 +72,8 @@ IDLE_COMMAND = "LED IDLE"
 
 CTK_PROCESS = "ctkahp"
 LOGIN_PROCESS = "loginwindow"
+SUDO_PROCESS = "sudo"
+SECURITY_AGENT_PROCESS = "SecurityAgent"
 
 # Marker emitted by pam_smartcard's own prompt. It fires a second time when the
 # PIN is submitted, in every case; the state machine tolerates the repeat.
@@ -94,6 +96,20 @@ SCREEN_LOCK_MARKER = "com.apple.screenIsLocked"
 SCREEN_UNLOCK_MARKER = "com.apple.screenIsUnlocked"
 
 SECURITY_AGENT_MARKER = "Checked in app : SecurityAgent"
+
+# Cancelling a prompt. macOS has no single "the dialog went away" event, so each
+# kind of prompt needs its own. Both are Default or Info level.
+#
+# pam_smartcard logs this when its PIN prompt is interrupted, typically Ctrl-C
+# on sudo. It repeats a few times as sudo retries; the LED dedup absorbs that.
+SUDO_CANCEL_MARKER = "SmartCard - Unable to get interactive PIN"
+
+# SecurityAgent closing its authentication window covers Cancel and Escape on
+# authorization dialogs. The alternative, loginwindow's appDeath notification
+# for SecurityAgent, was measured 11 seconds later: the process lingers well
+# after the window is gone.
+DIALOG_CLOSE_MARKER = "SFAuthenticationWindow"
+DIALOG_CLOSE_SUFFIX = "finishing close"
 
 # `startScreenLock` only fires when the screen locks. Someone who locks their
 # Mac and comes back later would find the LED long back to blue, which is
@@ -134,7 +150,12 @@ PREDICATE = (
     f'eventMessage CONTAINS "{SCREEN_UNLOCK_MARKER}" OR '
     f'eventMessage CONTAINS "{SCREEN_WAKE_MARKER}" OR '
     f'eventMessage CONTAINS "{DISPLAY_SLEEP_MARKER}" OR '
-    f'eventMessage CONTAINS "{SECURITY_AGENT_MARKER}"))'
+    f'eventMessage CONTAINS "{SECURITY_AGENT_MARKER}")) OR '
+    f'(process == "{SUDO_PROCESS}" AND '
+    f'eventMessage CONTAINS "{SUDO_CANCEL_MARKER}") OR '
+    f'(process == "{SECURITY_AGENT_PROCESS}" AND '
+    f'eventMessage CONTAINS "{DIALOG_CLOSE_MARKER}" AND '
+    f'eventMessage CONTAINS "{DIALOG_CLOSE_SUFFIX}")'
 )
 
 
@@ -142,6 +163,7 @@ class EventKind(Enum):
     """Kinds of authentication event recognised in the unified log."""
 
     PROMPT_OPENED = "prompt_opened"
+    PROMPT_CANCELLED = "prompt_cancelled"
     AUTHENTICATED = "authenticated"
     DISPLAY_OFF = "display_off"
     PIN_SUBMITTED = "pin_submitted"
@@ -272,6 +294,11 @@ def parse_log_line(line: str) -> PromptEvent | None:
         return PromptEvent(EventKind.CARD_INSERTED, "card")
     if process == CTK_PROCESS and SUDO_PROMPT_MARKER in message:
         return PromptEvent(EventKind.PROMPT_OPENED, "pam_smartcard")
+    if process == SUDO_PROCESS and SUDO_CANCEL_MARKER in message:
+        return PromptEvent(EventKind.PROMPT_CANCELLED, "sudo_cancelled")
+    if (process == SECURITY_AGENT_PROCESS and DIALOG_CLOSE_MARKER in message
+            and DIALOG_CLOSE_SUFFIX in message):
+        return PromptEvent(EventKind.PROMPT_CANCELLED, "dialog_closed")
     if process == LOGIN_PROCESS and SCREEN_UNLOCK_MARKER in message:
         return PromptEvent(EventKind.AUTHENTICATED, "screen_unlocked")
     if process == LOGIN_PROCESS and SCREEN_LOCK_MARKER in message:
@@ -463,6 +490,16 @@ class PromptWatcher:
             # submission, not a new prompt.
             LOGGER.debug("PIN submitted")
             self._cancel_pending()
+            return
+
+        if event.kind is EventKind.PROMPT_CANCELLED:
+            # No cooldown here: a dialog that closes on success is followed by
+            # its own result, and one that reopens for a retry must be free to
+            # light the LED again straight away.
+            LOGGER.info("prompt cancelled (%s)", event.source)
+            self._cancel_pending()
+            self._prompt_missed_at = 0.0
+            self._leds.send(IDLE_COMMAND)
             return
 
         if event.kind is EventKind.AUTHENTICATED:

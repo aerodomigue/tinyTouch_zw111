@@ -1,0 +1,13 @@
+# Target labels
+ bootloader
+# Source files and their labels
+/project/firmware/tiny_touch_unified/build-flash/CMakeFiles/bootloader
+/project/firmware/tiny_touch_unified/build-flash/CMakeFiles/bootloader.rule
+/project/firmware/tiny_touch_unified/build-flash/CMakeFiles/bootloader-complete.rule
+/project/firmware/tiny_touch_unified/build-flash/bootloader-prefix/src/bootloader-stamp/bootloader-build.rule
+/project/firmware/tiny_touch_unified/build-flash/bootloader-prefix/src/bootloader-stamp/bootloader-configure.rule
+/project/firmware/tiny_touch_unified/build-flash/bootloader-prefix/src/bootloader-stamp/bootloader-download.rule
+/project/firmware/tiny_touch_unified/build-flash/bootloader-prefix/src/bootloader-stamp/bootloader-install.rule
+/project/firmware/tiny_touch_unified/build-flash/bootloader-prefix/src/bootloader-stamp/bootloader-mkdir.rule
+/project/firmware/tiny_touch_unified/build-flash/bootloader-prefix/src/bootloader-stamp/bootloader-patch.rule
+/project/firmware/tiny_touch_unified/build-flash/bootloader-prefix/src/bootloader-stamp/bootloader-update.rule

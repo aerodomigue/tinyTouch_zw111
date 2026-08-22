@@ -1,0 +1,1 @@
+warning: the value 'y' is invalid for SOC_SDM_GROUPS (defined at /opt/esp/idf/./components/soc/esp32s3/include/soc/Kconfig.soc_caps.in:842), which has type int -- assignment ignored

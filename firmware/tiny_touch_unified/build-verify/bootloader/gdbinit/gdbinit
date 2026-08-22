@@ -1,0 +1,2 @@
+source /project/firmware/tiny_touch_unified/build-verify/bootloader/gdbinit/symbols
+source /project/firmware/tiny_touch_unified/build-verify/bootloader/gdbinit/connect

@@ -117,6 +117,29 @@ It is posted whatever unlocked the screen, exactly once per unlock, and pairs
 with `com.apple.screenIsLocked`. The card path emits both it and
 `Token login result`; the result cooldown keeps that from bouncing the LED.
 
+### Cancelling a prompt
+
+The 30 s hold was originally the only answer to a prompt that goes away without
+authenticating, on the assumption — inherited from the upstream README — that
+macOS exposes nothing when its dialog is dismissed. That turned out to be wrong,
+and two markers cover it, both at a level cheap enough to stream:
+
+| cancellation | marker | level |
+| --- | --- | --- |
+| Ctrl-C on a `sudo` PIN prompt | `sudo`: `SmartCard - Unable to get interactive PIN` | Default |
+| Cancel or Escape on an authorization dialog | `SecurityAgent`: `<SFAuthenticationWindow: …> finishing close` | Info |
+
+The `sudo` line repeats as pam retries, which the LED dedup absorbs.
+
+The obvious alternative for the dialog, `loginwindow`'s appDeath notification for
+SecurityAgent, is a trap: it was measured **11 seconds** after the window
+actually closed, because the process lingers. The window's own close is
+immediate.
+
+Neither event sets a cooldown. A dialog that closes on success is followed by its
+own result, and one that reopens for a retry has to be free to light the LED
+again straight away.
+
 One more marker closes the loop in the other direction. `loginwindow` logs
 SkyLight's `[ Display:Power ] Event: Did Sleep` when the display goes dark, which
 means nobody is standing there any more. Acting on it returns the LED to idle

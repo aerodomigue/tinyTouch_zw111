@@ -126,8 +126,11 @@ waiting, blue once the display goes dark, yellow again when you come back. Wake
 from sleep is included, even though the card needs about a second to
 re-enumerate.
 
+Cancelling clears it straight away rather than waiting: Ctrl-C on a `sudo` PIN
+prompt, or Cancel on an authorization dialog, returns the LED to blue.
+
 `LED PROMPT` shows the yellow effect and returns to idle by itself after 30
-seconds, so an abandoned prompt cannot leave the LED lit. Both commands are LED
+seconds, so a prompt that goes away unnoticed cannot leave the LED lit. Both commands are LED
 only: they grant no authorization, do not affect PIV key use, and are rate
 limited to one state change per 250 ms because the effect shares the sensor UART
 with fingerprint matching. They deliberately do not require `CONFIG_UNLOCK`.
