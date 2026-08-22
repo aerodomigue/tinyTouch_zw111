@@ -1,182 +1,188 @@
-## interested in preassembled versions? pre order now:
-[tinytouch.dev](https://tinytouch.dev)
+# tinyTouch
 
-<img width="2304" height="1152" alt="tinyTouch (4)" src="https://github.com/user-attachments/assets/ec66ec7d-3e14-4292-8085-15374e349057" />
+Fingerprint authentication for macOS built from an ESP32-S3 and a UART
+fingerprint sensor. It unlocks the screen, answers `sudo`, and satisfies
+authorization dialogs without typing a password.
 
-# tinytouch
-authenticate, sudo, and log in with your fingerprint wire(less)ly without having
-to spend $149.
+Fork of [ZimengXiong/tinyTouch](https://github.com/ZimengXiong/tinyTouch).
 
-build guide: https://www.youtube.com/watch?v=YsP1hRg28Gw
+## Table of contents
 
-https://github.com/user-attachments/assets/efede271-6d84-441d-919c-f5532f687c4e
-
-PIV authentication of sudo:
-
-https://github.com/user-attachments/assets/c197dd9c-81e5-4150-9793-d2e445651dfd
-
-PIV authentication of lockscreen (you know its PIV because it says PIN and not password in the entry field) (the typing is just the PIV PIN, which we bypass (since we gate by the fingerprint), read below to learn more about it)
-
-https://github.com/user-attachments/assets/88014cb2-34d2-4d63-8998-54f0561364eb
-
-if you would like to support this project, please consider [donating](https://github.com/sponsors/ZimengXiong) or contributing!
-
-
-## table of contents
-
-- [red pill or blue pill?](#red-pill-or-blue-pill)
-- [install](#install)
-  - [red pill](#red-pill)
-  - [blue pill](#blue-pill)
+- [Modes](#modes)
+- [Security trade-offs](#security-trade-offs)
 - [LED feedback](#led-feedback)
-- [fingerprint enrollment](#fingerprint-enrollment)
-- [hardware](#hardware)
-- [wiring](#wiring)
-- [notes](#notes)
+- [PIV prompt feedback](#piv-prompt-feedback)
+- [Install](#install)
+- [Fingerprint enrollment](#fingerprint-enrollment)
+- [Hardware](#hardware)
+- [Wiring](#wiring)
+- [Notes](#notes)
 
-## red pill or blue pill?
+## Modes
 
-there are two ways to use tinytouch on your computer: `HID` and `PIV/PAM` mode. read about how they work in the sections below.
+The device works in one of two modes, selected with `tinytouch mode`.
 
-each has its advantages, and we want to scare you a tiny bit so you actually do
-your diligence and understand the security implications of such a device before
-you decide whether you are willing to take on the risks:
+### HID mode
 
-| features | HID | PIV/PAM* |
+The ESP32 acts as a USB keyboard. Your real password stays on the Mac,
+encrypted, and the ESP32 keeps only a shared pairing key. After a fingerprint
+match the ESP32 sends a signed request to the host helper, which checks it,
+encrypts the password for that one request, and sends it back. The ESP32
+decrypts it in RAM, types it, then wipes it.
+
+This works almost everywhere a password is accepted. It is also the riskier
+mode: the final step is your real password being typed into whatever has focus.
+Requests carry a nonce and a MAC so old ones cannot be replayed, and the reply is
+a one-time encrypted response, but that does not change where the password ends
+up.
+
+### PIV mode
+
+The ESP32 acts as a USB smart card. macOS sends normal PIV commands over CCID
+and asks the card to use the PIV private key; the ESP32 only allows that key
+operation right after a fingerprint match.
+
+macOS also expects a PIV PIN, so the firmware has a small HID path that types the
+dummy PIN `000000`. That PIN is not your Mac password. It only gets past the
+macOS PIN dialog — the real authorization is the fingerprint gate around the PIV
+key. This avoids typing your real password, but only works where macOS accepts
+smart cards.
+
+### What each mode covers
+
+| | HID | PIV |
 | -- | -- | -- |
-| keyboardless login | ✅ | ✅ |
-| sudo prompts | ✅ | ✅ |
-| apple TCC (privacy & security) | ✅ | ✅|
-| general settings | ✅ | ❌ |
-| keychain/apple passwords | ✅ | ❌ |
-| everywhere your password is accepted (remote SSH sessions, etc) | ✅ | depends, but probably not |
+| Keyboardless login | yes | yes |
+| `sudo` prompts | yes | yes |
+| Apple TCC (Privacy & Security) | yes | yes |
+| General settings | yes | no |
+| Keychain / Apple Passwords | yes | no |
+| Anywhere a password is accepted (remote SSH, etc.) | yes | usually not |
 
-| security | HID | PIV/PAM* |
+## Security trade-offs
+
+| | HID | PIV |
 | -- | -- | -- |
-| fingerprint sensor <-> esp | 🔴 (unauth'ed UART) | 🔴 (unauth'ed UART) |
-| esp <-> computer negotiation | 🟢 (shared-key mac/encryption) | 🔴 (plain usb ccid/apdu) |
-| authentication | 🔴 (password typed over hid) | 🟢 (piv challenge/response) |
+| Sensor to ESP32 | unauthenticated UART | unauthenticated UART |
+| ESP32 to computer | shared-key MAC and encryption | plain USB CCID/APDU |
+| Authentication | password typed over HID | PIV challenge/response |
 
-| attack | HID | PIV/PAM* |
+| Attack | HID | PIV |
 | -- | -- | -- |
-| sensor uart spoofing^ | yes | yes |
-| wrong focused field | yes | no |
-| malicious password field | yes | no |
-| usb traffic sniffing | low impact (channel is encrypted/mac'ed) | can observe apdus, not piv private key |
-| usb keylogger | can reveal password | cannot reveal key |
-| usb command injection | reject bad macs/replays | device may receive apdus, but auth still needs fingerprint-gated key use |
-| flash dumping (secure boot/flash encryption off) | shared-key exposable | piv key exposable |
-| flash dumping (secure boot/flash encryption on) | shared-key non-exportable | piv key non-exportable |
-| flash dumping (with secure element) | shared key non-exportable | piv key non-exportable |
+| Sensor UART spoofing | possible | possible |
+| Wrong focused field | possible | no |
+| Malicious password field | possible | no |
+| USB traffic sniffing | low impact, channel is encrypted and MAC'd | APDUs observable, PIV private key is not |
+| USB keylogger | can reveal the password | cannot reveal the key |
+| USB command injection | bad MACs and replays rejected | APDUs accepted, but key use still needs a fingerprint |
+| Flash dump, no secure boot or flash encryption | shared key exposable | PIV key exposable |
+| Flash dump, secure boot and flash encryption on | shared key not exportable | PIV key not exportable |
+| Flash dump with a secure element | shared key not exportable | PIV key not exportable |
 
-*PIV/PAM always uses HID to deliver the mandatory PIV PIN, which we do not use.
-authorization is still gated by your fingerprint. the PIV PIN is not your
-password, and is not considered sensitive in our scenario.
+**Sensor UART spoofing is the significant weakness.** All authentication happens
+inside the fingerprint sensor, which talks to the ESP32 over an unauthenticated
+UART, so it can be spoofed by someone with physical access to the device.
+Filling the enclosure with black epoxy raises the bar; a properly authenticated
+sensor would fix it.
 
-^this is the major security issue with this device. since all authentication
-happens inside the fingerprint sensor, and the sensor communicates with the esp
-over unauthenticated uart, it can be easily spoofed. basic countermeasures
-involve filling the insides of the device with black epoxy. a more proper fix
-would be upgrading to a more secure fingerprint sensor.
-
-### so... which pill, if any?
-this depends on:
-
-1. your security tolerance
-2. your environment
-3. current/future criminal background
-4. family/roommate relations
-5. technical skill set of family members/roommates
-
-risks are low to begin with since every attack here requires *physical access* to
-both the device and your mac.
-
-so ask yourself: will your device ever leave your desk? can your roommates
-perform a flash dump in half an hour? how about your family members? do they have
-anything against you that would create a motive? are you wanted by any government
-agency? are you protecting sensitive or classified information? are you using a
-company device? would you be personally implicated if you leaked company secrets?
-
-if the answer is yes to any of the above questions, i think the magic keyboard presents an excellent value at $149 and is worth the added security.
-
-if the answer is no, chances are you will be fine with a slightly insecure method
-of authentication. personally, i am happy with the red pill and love the
-convenience of having it work everywhere.
-
-### hid mode
-
-in hid mode, the esp acts like a usb keyboard.
-
-the mac helper keeps your real password encrypted and stored on your mac. this
-way, an attacker cannot extract your password from the esp alone. the esp keeps a
-shared pairing key. after a fingerprint match, the esp sends a signed request to
-the helper, the helper checks it, encrypts the password for that one request, and
-sends it back. the esp decrypts it in ram, types it, then wipes it.
-
-this is why it works almost everywhere. it is also why it is scary: the final
-step is still your real password being typed into whatever has focus.
-
-to make it less bad, the esp never stores the password. requests use a nonce and
-mac so old requests cannot just be replayed, and the helper only sends back an
-encrypted one-time response. the password only exists on the esp briefly in ram.
-
-### piv mode
-
-in piv mode, the esp acts like a usb smart card.
-
-macos sends normal piv commands over ccid. when macos needs authentication, it
-asks the card to use the piv private key. the esp only allows that key operation
-right after a fingerprint match.
-
-macos also expects a piv pin, so the firmware has a tiny hid side path that types
-the dummy pin `000000`. that pin is not your mac password. it is just there to
-get through the macos piv prompt while the real authorization is the fingerprint
-gate around the piv key.
-
-this avoids typing your real password, but only works where macos accepts smart
-cards, like login and `sudo` with pam.
-
-For details about the ESP32-S3 USB sleep/wake failure and its native TinyUSB
-recovery path, see [USB suspend and resume recovery](docs/usb-suspend-resume.md).
+Every attack listed here needs physical access to both the device and your Mac.
+Enable secure boot and flash encryption if that assumption does not hold for you.
 
 ## LED feedback
 
-tinyTouch controls the Hi-Link ZW111 LED with its multi-function `0x3C` command.
-Each state transition is sent once; the sensor performs the effect itself, so
+tinyTouch drives the Hi-Link ZW111 LED with its multi-function `0x3C` command.
+Each state transition is sent once and the sensor runs the effect itself, so
 there is no host-side animation loop.
+
+| State | Colour and effect |
+| --- | --- |
+| Idle / sleep | Blue breathing, 10-second period |
+| Touch requested | Yellow breathing, 1-second period |
+| Fingerprint rejected | Two red flashes, 0.5 s each |
+| Fingerprint accepted | Two green flashes, 0.5 s each |
+
+After a result the LED returns to idle. A request triggered by the CLI also
+returns to idle after seven seconds without an image.
 
 On the first boot with this firmware, tinyTouch provisions the ZW111's
 persistent manual LED mode. Disconnect and reconnect USB once after the log
-message requests it, ensuring the ZW111's VCC actually falls to 0 V: an ESP32
-reset alone is insufficient. This changes only the sensor LED mode; it does not erase
-fingerprint templates, PIV keys, or other device configuration.
+message asks for it, making sure the ZW111's VCC actually falls to 0 V — an
+ESP32 reset alone is not enough. This changes only the sensor LED mode; it does
+not erase fingerprint templates, PIV keys, or any other configuration.
 
-| state | color and effect |
-| --- | --- |
-| idle / sleep | blue breathing, 10-second period |
-| interactive fingerprint request | yellow breathing, 1-second period |
-| fingerprint rejected | two red flashes, 0.5 seconds each |
-| fingerprint accepted | two green flashes, 0.5 seconds each |
+## PIV prompt feedback
 
-After a result, tinyTouch returns to idle. An interactive request also returns
-to idle after seven seconds without an image. macOS does not expose a direct
-notification when its authentication popup is cancelled, so this timeout is the
-fallback for a cancelled or abandoned request.
+In PIV mode the device cannot tell on its own that macOS is asking for the PIN:
+no APDU reaches the card between the prompt appearing and the PIN being
+submitted. Without help, the LED stays blue while macOS waits for a touch.
 
-## fingerprint enrollment
+The `LED PROMPT` and `LED IDLE` console commands let a host say so, and
+`software/macos-helper/tinytouch_prompt_watcher.py` sends them by watching the
+unified log for macOS authentication events. It covers `sudo`, authorization
+dialogs, the lock screen, the screensaver and wake from sleep.
 
-Fingerprint enrollment captures the center and four edges of the same finger,
-with a full lift between each capture. The ZW111 merges the five samples into a
-single template in the selected slot. Run `tinytouch enroll --slot 1` and follow
-the terminal instructions. Existing templates are not upgraded automatically.
+On a locked screen the LED follows the display: yellow while the screen is on and
+waiting, blue once the display goes dark, yellow again when you come back. Wake
+from sleep is included, even though the card needs about a second to
+re-enumerate.
 
-See [guided fingerprint enrollment](docs/fingerprint-enrollment.md) for the
-capture sequence, timeouts, replacement behavior, and protocol details.
+`LED PROMPT` shows the yellow effect and returns to idle by itself after 30
+seconds, so an abandoned prompt cannot leave the LED lit. Both commands are LED
+only: they grant no authorization, do not affect PIV key use, and are rate
+limited to one state change per 250 ms because the effect shares the sensor UART
+with fingerprint matching. They deliberately do not require `CONFIG_UNLOCK`.
 
-## install
+### Install the service
 
-### red pill
-use this if you just want the thing to type your password.
+```sh
+tinytouch daemon install
+tinytouch daemon status
+tinytouch daemon uninstall
+```
+
+`install` is idempotent: run it again to reinstall over an existing copy.
+`status` reports whether the service is installed and running, and is also part
+of `tinytouch status`.
+
+The service runs as a LaunchAgent in your login session, so it does not cover
+the login window before you sign in. Everything after that is covered.
+
+### Run it by hand
+
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -r software/macos-helper/requirements.txt
+
+# check the log markers exist on this macOS version
+.venv/bin/python software/macos-helper/tinytouch_prompt_watcher.py --self-test
+
+# watch the events without touching the device
+.venv/bin/python software/macos-helper/tinytouch_prompt_watcher.py --dry-run --verbose
+
+# run it for real
+.venv/bin/python software/macos-helper/tinytouch_prompt_watcher.py
+```
+
+To start it at login without the CLI, write a LaunchAgent to
+`~/Library/LaunchAgents/com.tinytouch.promptwatcher.plist` with `RunAtLoad` and
+`KeepAlive` set and `ProgramArguments` pointing at that interpreter and script,
+then load it with `launchctl bootstrap gui/$UID <plist>`. The CLI logs to
+`/tmp/tinytouch-prompt-watcher.log`, with errors in the matching `.err` file.
+
+Only one process may hold the serial port. The CLI stops the service for the
+duration of any command that talks to the device and restarts it afterwards. If
+you run the watcher by hand, stop it before `tinytouch enroll` and similar
+commands.
+
+Rerun `--self-test` after a macOS upgrade. These log messages are not API and
+Apple can rename them; if they disappear the watcher goes quiet rather than
+misbehaving. See [PIV prompt feedback](docs/piv-prompt-feedback.md) for the
+measurements behind the markers and the alternatives that were rejected.
+
+## Install
+
+### HID mode
 
 ```sh
 python3 -m venv .venv
@@ -186,39 +192,22 @@ pip install -r software/macos-helper/requirements.txt
 pairing_key="$(openssl rand -hex 32)"
 .venv/bin/python software/macos-helper/tinytouch_helper.py --set-pairing-key "$pairing_key"
 .venv/bin/python software/macos-helper/tinytouch_helper.py --set-password 'your-password-here'
-
-cp firmware/tiny_touch_keyboard/secrets.example.h firmware/tiny_touch_keyboard/secrets.h
 ```
 
-edit `firmware/tiny_touch_keyboard/secrets.h` so it contains the same pairing
-key bytes, then flash `firmware/tiny_touch_keyboard/tiny_touch_keyboard.ino`
-with arduino ide.
-
-board settings used here:
-
-```text
-usb cdc on boot: enabled
-usb mode: usb-otg
-```
-
-run the helper:
+Run the helper with:
 
 ```sh
 .venv/bin/python software/macos-helper/tinytouch_helper.py
 ```
 
-for launchd, edit paths in
-`software/macos-helper/launchd/com.tinytouch.helper.plist`, then copy it to
+For launchd, edit the paths in
+`software/macos-helper/launchd/com.tinytouch.helper.plist` and copy it to
 `~/Library/LaunchAgents/`.
 
-### blue pill
+### PIV mode
 
-use this if you want the current better path. it exposes piv over ccid, plus hid
-only for the dummy pin `000000`.
-
-`main/secrets.h` needs the piv certs and private keys for slots `9a` and `9d`.
-
-generate test keys:
+`main/secrets.h` needs the PIV certificates and private keys for slots `9a` and
+`9d`. Generate test keys with:
 
 ```sh
 cd firmware/tiny_touch_smartcard
@@ -227,14 +216,11 @@ openssl req -newkey rsa:2048 -nodes -keyout piv_key_9d.pem -x509 -days 3650 -out
 cp main/secrets.example.h main/secrets.h
 ```
 
-then paste:
+Then paste `piv_cert_9a.pem` into `PIV_CERT_9A_PEM`, `piv_key_9a.pem` into
+`PIV_PRIVATE_KEY_9A_PEM`, `piv_cert_9d.pem` into `PIV_CERT_9D_PEM`, and
+`piv_key_9d.pem` into `PIV_PRIVATE_KEY_9D_PEM`.
 
-- `piv_cert_9a.pem` into `PIV_CERT_9A_PEM`
-- `piv_key_9a.pem` into `PIV_PRIVATE_KEY_9A_PEM`
-- `piv_cert_9d.pem` into `PIV_CERT_9D_PEM`
-- `piv_key_9d.pem` into `PIV_PRIVATE_KEY_9D_PEM`
-
-build and flash:
+Build and flash:
 
 ```sh
 idf.py set-target esp32s3
@@ -242,7 +228,7 @@ idf.py build
 idf.py -p /dev/cu.usbmodem101 flash
 ```
 
-after flashing:
+Then pair the identity with your macOS account:
 
 ```sh
 system_profiler SPSmartCardsDataType
@@ -250,47 +236,54 @@ sc_auth identities
 sudo sc_auth pair -u "$USER" -h <auth-cert-hash>
 ```
 
-to test sudo:
+Test it:
 
 ```sh
 sudo -k
 sudo -v
 ```
 
-when macos asks for the pin, touch the sensor.
+Touch the sensor when macOS asks for the PIN.
 
-## hardware
+For the ESP32-S3 USB sleep/wake failure and its TinyUSB recovery path, see
+[USB suspend and resume recovery](docs/usb-suspend-resume.md).
 
-| part | used here | notes |
+## Fingerprint enrollment
+
+Enrollment captures the centre and four edges of the same finger, with a full
+lift between each capture. The ZW111 merges the five samples into a single
+template in the selected slot. Run `tinytouch enroll --slot 1` and follow the
+terminal instructions. Existing templates are not upgraded automatically.
+
+See [guided fingerprint enrollment](docs/fingerprint-enrollment.md) for the
+capture sequence, timeouts, replacement behaviour, and protocol details.
+
+## Hardware
+
+| Part | Used here | Notes |
 | -- | -- | -- |
-| microcontroller | seeed studio esp32-s3 | needs native usb and hardware uart. secure boot + flash encryption strongly recommended |
-| fingerprint sensor | zw101-style uart sensor | uses the common `0xef01` packet protocol |
-| computer | macos | hid mode needs the helper. piv/pam mode needs macos smart card support |
-| case | printed top/bottom stl | `hardware/case/case_top.stl` and `hardware/case/case_bottom.stl` |
-| wiring/solder/etc | misc | whatever your build needs |
+| Microcontroller | Seeed Studio ESP32-S3 | Needs native USB and a hardware UART. Secure boot and flash encryption strongly recommended |
+| Fingerprint sensor | ZW101-style UART sensor | Uses the common `0xEF01` packet protocol |
+| Computer | macOS | HID mode needs the helper, PIV mode needs macOS smart card support |
+| Case | Printed top and bottom | `hardware/case/case_top.stl`, `hardware/case/case_bottom.stl` |
 
-other esp32-s3 boards should work if the usb and uart pins are available. other
-fingerprint sensors may work if they speak the same uart protocol. other
-microcontroller families can work, but are not currently supported.
+Other ESP32-S3 boards work if the USB and UART pins are available. Other
+fingerprint sensors may work if they speak the same UART protocol. Other
+microcontroller families are not supported.
 
-## wiring
+Build guide: <https://www.youtube.com/watch?v=YsP1hRg28Gw>
 
-the fingerprint sensor connects over uart to pins 6 and 7 for tx and rx.
+[CAD](https://cad.onshape.com/documents/d0e6bb7977e6171d4e4a5086/w/1ded27ad6c634fd1fdaf26d0/e/aca67210e400490a08d0b29a?renderMode=0&uiState=6a4c1df32e292f12144a65fe).
+If you change it, please keep your changes open source too.
 
-the interrupt pin can be connected anywhere. in firmware, it is connected to pin
-1.
+## Wiring
 
-## notes
+The fingerprint sensor connects over UART to pins 6 and 7 for TX and RX. The
+interrupt pin can go anywhere; the firmware uses pin 1.
 
-do not commit:
+## Notes
+
+Do not commit:
 
 - `firmware/tiny_touch_keyboard/secrets.h`
 - `firmware/tiny_touch_smartcard/main/secrets.h`
-
-[cad](https://cad.onshape.com/documents/d0e6bb7977e6171d4e4a5086/w/1ded27ad6c634fd1fdaf26d0/e/aca67210e400490a08d0b29a?renderMode=0&uiState=6a4c1df32e292f12144a65fe). if you make changes, please make them open source as well.
-
-## bonus images
-
-<img width="2261" height="1347" alt="render2" src="https://github.com/user-attachments/assets/5f107d74-d651-4e3b-90ed-f37dcaa026ac" />
-<img width="1238" height="901" alt="cross" src="https://github.com/user-attachments/assets/6a7062d9-ec56-4aac-adad-00d888e7d486" />
-<img width="1280" height="957" alt="tinyTouch" src="https://github.com/user-attachments/assets/ad66c9b3-5823-44d3-bd73-bba64f2e60ab" />
