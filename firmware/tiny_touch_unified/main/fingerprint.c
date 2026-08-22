@@ -123,8 +123,9 @@ static const fp_led_command_t FP_LED_ACCEPTED_COMMAND = {
 
 static fp_led_state_t led_state = FP_LED_STATE_UNKNOWN;
 static SemaphoreHandle_t fp_mutex;
-// Tick at which a host-requested prompt returns to idle; 0 when none is armed.
-static TickType_t led_prompt_deadline;
+// Tick at which the LED returns to idle; 0 when nothing is armed. Used both for
+// a host-requested prompt and for the result effect.
+static TickType_t led_revert_deadline;
 
 static uint16_t fp_checksum(uint8_t packet_id, const uint8_t *payload, size_t payload_len) {
   uint16_t length = payload_len + 2;
@@ -316,20 +317,30 @@ static bool led_apply(fp_led_state_t state) {
   return true;
 }
 
+static void arm_led_revert(uint32_t hold_ms) {
+  TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(hold_ms);
+  // A deadline of zero is the "disarmed" marker, so the one tick value that
+  // would collide with it is nudged forward.
+  led_revert_deadline = deadline ? deadline : 1;
+}
+
 static void show_result(bool ok) {
   fp_led_state_t result_state = ok ? FP_LED_STATE_ACCEPTED : FP_LED_STATE_REJECTED;
   const fp_led_command_t *command = led_command_for_state(result_state);
-  // A result supersedes any pending prompt: the touch it was asking for
-  // has happened.
-  led_prompt_deadline = 0;
-  if (led_apply(result_state)) {
-    vTaskDelay(pdMS_TO_TICKS(led_command_duration_ms(command)));
+  if (!led_apply(result_state)) {
+    led_revert_deadline = 0;
+    return;
   }
-  led_apply(FP_LED_STATE_IDLE);
+  // The ZW111 plays the effect on its own, so there is nothing to wait for
+  // here. Returning immediately lets the caller type the PIV PIN while the
+  // flashes run instead of a second later; fingerprint_led_tick() restores
+  // idle once they are done. A result also supersedes any pending prompt: the
+  // touch it was asking for has happened.
+  arm_led_revert(led_command_duration_ms(command));
 }
 
 void fingerprint_led_idle(void) {
-  led_prompt_deadline = 0;
+  led_revert_deadline = 0;
   if (!fp_take(1000)) return;
   led_apply(FP_LED_STATE_IDLE);
   fp_give();
@@ -340,25 +351,20 @@ bool fingerprint_led_prompt(void) {
   bool applied = led_apply(FP_LED_STATE_PROMPT);
   fp_give();
   if (!applied) return false;
-  TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(FP_LED_PROMPT_HOLD_MS);
-  // A deadline of zero is the "disarmed" marker, so the one tick value that
-  // would collide with it is nudged forward.
-  led_prompt_deadline = deadline ? deadline : 1;
+  arm_led_revert(FP_LED_PROMPT_HOLD_MS);
   return true;
 }
 
 void fingerprint_led_tick(void) {
-  TickType_t deadline = led_prompt_deadline;
+  TickType_t deadline = led_revert_deadline;
   if (deadline == 0) return;
   // Signed difference so the comparison survives the tick counter wrapping.
   if ((int32_t)(xTaskGetTickCount() - deadline) < 0) return;
-  led_prompt_deadline = 0;
-  if (!fp_take(0)) {
-    // The sensor is busy, most likely matching the finger this prompt asked
-    // for. Whatever that exchange concludes will set the LED itself.
-    return;
-  }
+  // Keep the deadline armed until idle is really applied, so a sensor that is
+  // busy right now is retried on the next tick instead of leaving the LED lit.
+  if (!fp_take(0)) return;
   led_apply(FP_LED_STATE_IDLE);
+  led_revert_deadline = 0;
   fp_give();
 }
 

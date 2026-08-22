@@ -213,8 +213,12 @@ missing was a way to drive it from the host and an automatic return to idle:
   `FP_LED_STATE_IDLE`. It is called from the existing `touch_hid_task` loop in
   `touch_pin_hid.c`, which already runs every 250 ms, rather than adding a task
   or an `esp_timer` callback that would block on the sensor mutex.
-- `show_result()` clears the deadline: a result supersedes the prompt that asked
-  for it.
+- `show_result()` re-arms the deadline with the result effect's own duration
+  instead of blocking on it. It used to `vTaskDelay` for the full second the two
+  flashes take, and since it sits on the authentication path, the PIV PIN was
+  typed a second later than it needed to be. The ZW111 plays the effect itself,
+  so there was never anything to wait for. A result also supersedes the prompt
+  that asked for it.
 - Two console commands in `config_console.c`: `LED PROMPT` and `LED IDLE`.
 
 The hold lives in the firmware and only there. The host does not duplicate the
@@ -232,9 +236,10 @@ Two implementation details worth remembering:
 
 - The deadline comparison casts the tick difference to `int32_t` so it stays
   correct across a tick-counter wrap.
-- `fingerprint_led_tick()` takes the mutex with a zero timeout. If the sensor is
-  busy it simply skips: that means a match is in progress, and whatever it
-  concludes sets the LED itself.
+- `fingerprint_led_tick()` takes the mutex with a zero timeout and keeps the
+  deadline armed until idle is really applied, so a sensor busy with a long
+  operation such as enrollment is retried on the next tick rather than leaving
+  the LED lit.
 
 ### Host daemon
 
