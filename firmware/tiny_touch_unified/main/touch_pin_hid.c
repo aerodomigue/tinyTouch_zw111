@@ -302,6 +302,7 @@ static void touch_hid_task(void *arg) {
   TickType_t last_success = 0;
 
   while (true) {
+    fingerprint_led_tick();
     if (tud_hid_ready() &&
         (xTaskGetTickCount() - last_success) > pdMS_TO_TICKS(3000) &&
         fingerprint_authorize_poll_once()) {

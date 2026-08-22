@@ -30,6 +30,7 @@ mkdir -p "$build_dir" "$dist_dir"
   --specpath "$build_dir/spec-cli" \
   --paths "$project_dir/software/macos-helper" \
   --hidden-import tinytouch_helper \
+  --hidden-import tinytouch_prompt_watcher \
   --hidden-import serial.tools.list_ports \
   --add-data "$project_dir/VERSION:." \
   "$project_dir/tinytouch"

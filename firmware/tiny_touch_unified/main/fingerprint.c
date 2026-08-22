@@ -39,6 +39,10 @@ static const uint8_t FP_LED_IDLE_PERIOD_TENTHS = 100;
 static const uint8_t FP_LED_PROMPT_PERIOD_TENTHS = 10;
 static const uint8_t FP_LED_FLASH_PERIOD_TENTHS = 5;
 static const uint32_t FP_LED_TENTH_SECOND_MS = 100;
+// A host-requested prompt is held for this long and then falls back to idle.
+// macOS emits no event when its PIN dialog is dismissed, so an abandoned prompt
+// would otherwise leave the LED breathing yellow indefinitely.
+static const uint32_t FP_LED_PROMPT_HOLD_MS = 30000;
 static const char *FP_LED_NVS_NAMESPACE = "fingerprint";
 static const char *FP_LED_MANUAL_MODE_KEY = "led_manual_mode";
 static const uint32_t FP_IMAGE_COMMAND_MAX_WAIT_MS = 1000;
@@ -119,6 +123,8 @@ static const fp_led_command_t FP_LED_ACCEPTED_COMMAND = {
 
 static fp_led_state_t led_state = FP_LED_STATE_UNKNOWN;
 static SemaphoreHandle_t fp_mutex;
+// Tick at which a host-requested prompt returns to idle; 0 when none is armed.
+static TickType_t led_prompt_deadline;
 
 static uint16_t fp_checksum(uint8_t packet_id, const uint8_t *payload, size_t payload_len) {
   uint16_t length = payload_len + 2;
@@ -313,6 +319,9 @@ static bool led_apply(fp_led_state_t state) {
 static void show_result(bool ok) {
   fp_led_state_t result_state = ok ? FP_LED_STATE_ACCEPTED : FP_LED_STATE_REJECTED;
   const fp_led_command_t *command = led_command_for_state(result_state);
+  // A result supersedes any pending prompt: the touch it was asking for
+  // has happened.
+  led_prompt_deadline = 0;
   if (led_apply(result_state)) {
     vTaskDelay(pdMS_TO_TICKS(led_command_duration_ms(command)));
   }
@@ -320,7 +329,35 @@ static void show_result(bool ok) {
 }
 
 void fingerprint_led_idle(void) {
+  led_prompt_deadline = 0;
   if (!fp_take(1000)) return;
+  led_apply(FP_LED_STATE_IDLE);
+  fp_give();
+}
+
+bool fingerprint_led_prompt(void) {
+  if (!fp_take(1000)) return false;
+  bool applied = led_apply(FP_LED_STATE_PROMPT);
+  fp_give();
+  if (!applied) return false;
+  TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(FP_LED_PROMPT_HOLD_MS);
+  // A deadline of zero is the "disarmed" marker, so the one tick value that
+  // would collide with it is nudged forward.
+  led_prompt_deadline = deadline ? deadline : 1;
+  return true;
+}
+
+void fingerprint_led_tick(void) {
+  TickType_t deadline = led_prompt_deadline;
+  if (deadline == 0) return;
+  // Signed difference so the comparison survives the tick counter wrapping.
+  if ((int32_t)(xTaskGetTickCount() - deadline) < 0) return;
+  led_prompt_deadline = 0;
+  if (!fp_take(0)) {
+    // The sensor is busy, most likely matching the finger this prompt asked
+    // for. Whatever that exchange concludes will set the LED itself.
+    return;
+  }
   led_apply(FP_LED_STATE_IDLE);
   fp_give();
 }

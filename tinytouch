@@ -30,9 +30,12 @@ VERSION_FILE = BUNDLE_ROOT / "VERSION"
 CLI_VERSION = VERSION_FILE.read_text(encoding="utf-8").strip() if VERSION_FILE.exists() else "development"
 UNIFIED_FIRMWARE_PROJECT = ROOT / "firmware" / "tiny_touch_unified"
 HELPER = ROOT / "software" / "macos-helper" / "tinytouch_helper.py"
+PROMPT_WATCHER = ROOT / "software" / "macos-helper" / "tinytouch_prompt_watcher.py"
 REQUIREMENTS = ROOT / "software" / "macos-helper" / "requirements.txt"
 VENV = ROOT / ".venv"
 LAUNCH_AGENT = Path.home() / "Library" / "LaunchAgents" / "com.tinytouch.helper.plist"
+WATCHER_LABEL = "com.tinytouch.promptwatcher"
+WATCHER_AGENT = Path.home() / "Library" / "LaunchAgents" / f"{WATCHER_LABEL}.plist"
 SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "tinyTouch"
 INSTALLED_SERVICE = SUPPORT_DIR / "tinytouch-service"
 PAIRING_SERVICE = "tinyTouch-pairing"
@@ -43,6 +46,7 @@ CLI_INSTALL_DIR = Path.home() / ".local" / "bin"
 CLI_INSTALL_PATH = CLI_INSTALL_DIR / "tinytouch"
 VERBOSE = False
 HELPER_SUSPENDED = False
+WATCHER_SUSPENDED = False
 FACTORY_FLASH_URL = "https://alpacaengineer.ing/tinytouch/batch-0/flash/"
 FINGERPRINT_ENROLL_TIMEOUT_SECONDS = 105.0
 
@@ -573,22 +577,117 @@ def load_helper() -> None:
     run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(LAUNCH_AGENT)])
 
 
+def ensure_installed_service() -> None:
+    """Place the frozen CLI where the launch agents expect to find it.
+
+    Both background services run this binary with an internal subcommand, so it
+    must exist independently of wherever the user launched the CLI from.
+    """
+    if not FROZEN:
+        return
+    SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
+    temporary = INSTALLED_SERVICE.with_suffix(".tmp")
+    shutil.copy2(Path(sys.executable).resolve(), temporary)
+    temporary.chmod(0o755)
+    try:
+        os.removexattr(temporary, "com.apple.quarantine")
+    except (AttributeError, OSError):
+        pass
+    temporary.replace(INSTALLED_SERVICE)
+
+
 def install_helper(python: Path) -> None:
     unload_helper()
-    if FROZEN:
-        SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
-        temporary = INSTALLED_SERVICE.with_suffix(".tmp")
-        shutil.copy2(Path(sys.executable).resolve(), temporary)
-        temporary.chmod(0o755)
-        try:
-            os.removexattr(temporary, "com.apple.quarantine")
-        except (AttributeError, OSError):
-            pass
-        temporary.replace(INSTALLED_SERVICE)
+    ensure_installed_service()
     LAUNCH_AGENT.parent.mkdir(parents=True, exist_ok=True)
     LAUNCH_AGENT.write_bytes(launch_agent_contents(python))
     if not HELPER_SUSPENDED:
         load_helper()
+
+
+def watcher_agent_contents(python: Path) -> bytes:
+    arguments = [str(INSTALLED_SERVICE), "_watcher"] if FROZEN else [str(python), str(PROMPT_WATCHER)]
+    payload = {
+        "Label": WATCHER_LABEL,
+        "ProgramArguments": arguments,
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "StandardOutPath": "/tmp/tinytouch-prompt-watcher.log",
+        "StandardErrorPath": "/tmp/tinytouch-prompt-watcher.err",
+    }
+    return plistlib.dumps(payload, sort_keys=False)
+
+
+def watcher_job_loaded() -> bool:
+    result = subprocess.run(
+        ["launchctl", "print", f"gui/{os.getuid()}/{WATCHER_LABEL}"],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
+
+def watcher_processes_running() -> bool:
+    patterns = (str(INSTALLED_SERVICE) + " _watcher", str(PROMPT_WATCHER))
+    return any(
+        subprocess.run(
+            ["pgrep", "-f", pattern],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode == 0
+        for pattern in patterns
+    )
+
+
+def unload_watcher() -> bool:
+    was_running = watcher_job_loaded() or watcher_processes_running()
+    if not was_running:
+        return False
+    if WATCHER_AGENT.exists():
+        subprocess.run(
+            ["launchctl", "bootout", f"gui/{os.getuid()}", str(WATCHER_AGENT)],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    patterns = (str(INSTALLED_SERVICE) + " _watcher", str(PROMPT_WATCHER))
+    for pattern in patterns:
+        subprocess.run(
+            ["pkill", "-TERM", "-f", pattern],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    deadline = time.monotonic() + 6
+    while watcher_job_loaded() or watcher_processes_running():
+        if time.monotonic() >= deadline:
+            raise ToolError(
+                "The PIV prompt LED service did not release the serial port. Run "
+                "'tinytouch status' again; if this repeats, unplug and reconnect tinyTouch."
+            )
+        time.sleep(0.05)
+    time.sleep(0.15)
+    return was_running
+
+
+def load_watcher() -> None:
+    unload_watcher()
+    run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(WATCHER_AGENT)])
+
+
+def install_watcher(python: Path) -> None:
+    unload_watcher()
+    ensure_installed_service()
+    WATCHER_AGENT.parent.mkdir(parents=True, exist_ok=True)
+    WATCHER_AGENT.write_bytes(watcher_agent_contents(python))
+    load_watcher()
+
+
+def remove_watcher() -> None:
+    unload_watcher()
+    WATCHER_AGENT.unlink(missing_ok=True)
 
 
 def prompt_password() -> str:
@@ -993,6 +1092,42 @@ def configure_hid_credentials(port: str, status: dict[str, str]) -> None:
     say("  ✓ Background HID service installed for this Mac user.")
 
 
+def offer_prompt_watcher(mode: str, *, skip: bool = False) -> None:
+    """Offer to install the service that lights the LED on macOS prompts.
+
+    Runs at the end of setup, once every command that needs the serial port is
+    done, because the service takes that port as soon as it starts.
+    """
+    if skip:
+        return
+    say()
+    say("Optional: LED feedback for authentication prompts")
+    if WATCHER_AGENT.exists():
+        say("  ✓ Already installed. Manage it with 'tinytouch daemon'.")
+        return
+    say("Without this, nothing tells the device that macOS is waiting, so the")
+    say("sensor stays blue until you touch it. A small background service")
+    say("watches macOS for authentication prompts and turns the sensor yellow.")
+    if mode == "hid":
+        say("In HID mode it covers the lock screen, the screensaver and")
+        say("authorization dialogs, but not sudo in a terminal.")
+    try:
+        answer = ask("Install it? [Y/n]: ")
+    except ToolError:
+        say("  No answer available. Run 'tinytouch daemon install' when you want it.")
+        return
+    if answer.strip().lower() in {"n", "no"}:
+        say("  Skipped. Run 'tinytouch daemon install' whenever you want it.")
+        return
+    try:
+        install_watcher(ensure_helper_environment())
+    except ToolError as exc:
+        say(f"  Could not install it: {exc}")
+        say("  Setup continues; try 'tinytouch daemon install' later.")
+        return
+    say("  ✓ Installed and started.")
+
+
 def configure_unified_device(
     args: argparse.Namespace, mode: str, port: str, status: dict[str, str],
     *, first_step: int, total_steps: int,
@@ -1057,6 +1192,7 @@ def configure_unified_device(
         pair_piv(port=port)
     elif mode == "piv":
         say("macOS smart-card pairing was skipped as requested.")
+    offer_prompt_watcher(mode, skip=getattr(args, "no_daemon", False))
     say()
     say(f"Setup complete — {mode.upper()} mode is ready.")
     say("Unplug tinyTouch, reconnect it, then run: tinytouch test")
@@ -1239,6 +1375,7 @@ def command_status(args: argparse.Namespace) -> None:
             if fields.get("firmware") != "unified":
                 say(f"Action: flash the unified firmware at {FACTORY_FLASH_URL}.")
     say(f"HID background service: {'installed' if LAUNCH_AGENT.exists() else 'not installed'}")
+    say_watcher_state()
     if shutil.which("sc_auth"):
         identities = subprocess.run(["sc_auth", "identities"], text=True, capture_output=True)
         verbose("sc_auth identities output: " + (identities.stdout.strip() or "none"))
@@ -1365,6 +1502,47 @@ def command_factory_reset(args: argparse.Namespace) -> None:
     say("The device is now unconfigured. Run 'tinytouch setup' to use it again.")
 
 
+def say_watcher_state() -> None:
+    if not WATCHER_AGENT.exists():
+        say("PIV prompt LED service: not installed")
+        return
+    if WATCHER_SUSPENDED:
+        # Device commands stop the service to free the serial port, so reporting
+        # what launchctl sees right now would just describe our own doing.
+        state = "running, paused while this command talks to the device"
+    elif watcher_job_loaded() or watcher_processes_running():
+        state = "running"
+    else:
+        state = "not running"
+    say(f"PIV prompt LED service: installed, {state}")
+    say(f"  agent: {WATCHER_AGENT}")
+    say("  logs:  /tmp/tinytouch-prompt-watcher.log (errors in .err)")
+
+
+def command_daemon(args: argparse.Namespace) -> None:
+    if args.action == "status":
+        say_watcher_state()
+        return
+
+    if args.action == "uninstall":
+        if not WATCHER_AGENT.exists() and not watcher_processes_running():
+            say("PIV prompt LED service is not installed. Nothing to do.")
+            return
+        remove_watcher()
+        say("PIV prompt LED service removed.")
+        say("The LED no longer follows macOS PIN prompts.")
+        return
+
+    if WATCHER_AGENT.exists():
+        say("PIV prompt LED service is already installed. Reinstalling it.")
+    python = ensure_helper_environment()
+    install_watcher(python)
+    say("PIV prompt LED service installed and started.")
+    say("The sensor now turns yellow when macOS asks for the PIV PIN.")
+    say("It runs in your login session, so it does not cover the login window")
+    say("before you sign in. Everything after that is covered.")
+
+
 def command_bootloader(args: argparse.Namespace) -> None:
     port = choose_port(args.port)
     fields = status_fields(port)
@@ -1430,6 +1608,10 @@ def parser() -> argparse.ArgumentParser:
     setup.add_argument("--port", help="use a specific /dev/cu.* device")
     setup.add_argument("--skip-enroll", action="store_true", help="do not enroll a fingerprint")
     setup.add_argument("--no-pair", action="store_true", help="do not pair PIV with the current Mac user")
+    setup.add_argument(
+        "--no-daemon", action="store_true",
+        help="do not offer the LED feedback service for authentication prompts",
+    )
     setup.set_defaults(func=command_setup)
 
     mode = sub.add_parser("mode", help="switch runtime mode without reflashing")
@@ -1438,6 +1620,10 @@ def parser() -> argparse.ArgumentParser:
     mode.add_argument("--port", help="use a specific /dev/cu.* device")
     mode.add_argument("--skip-enroll", action="store_true", help="do not enroll a missing fingerprint")
     mode.add_argument("--no-pair", action="store_true", help="do not pair PIV with macOS")
+    mode.add_argument(
+        "--no-daemon", action="store_true",
+        help="do not offer the LED feedback service for authentication prompts",
+    )
     mode.set_defaults(func=command_mode)
 
     add_computer = sub.add_parser(
@@ -1476,6 +1662,17 @@ def parser() -> argparse.ArgumentParser:
     pair.add_argument("--identity", help="40-character identity hash from 'sc_auth identities'")
     pair.add_argument("--port", help="use a specific /dev/cu.* device")
     pair.set_defaults(func=command_pair)
+
+    daemon = sub.add_parser(
+        "daemon", help="manage the background service that lights the LED on PIN prompts"
+    )
+    add_verbose_option(daemon)
+    daemon.add_argument(
+        "action",
+        choices=["install", "uninstall", "status"],
+        help="install and start it, remove it, or report whether it is installed",
+    )
+    daemon.set_defaults(func=command_daemon)
 
     keys = sub.add_parser("keys", help="rotate customer PIV keys without rebuilding firmware")
     add_verbose_option(keys)
@@ -1516,13 +1713,18 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    global VERBOSE, HELPER_SUSPENDED
+    global VERBOSE, HELPER_SUSPENDED, WATCHER_SUSPENDED
     if FROZEN and len(sys.argv) > 1 and sys.argv[1] == "_helper":
         sys.argv = ["tinytouch-helper", *sys.argv[2:]]
         from tinytouch_helper import main as helper_main  # type: ignore
 
         helper_main()
         return 0
+    if FROZEN and len(sys.argv) > 1 and sys.argv[1] == "_watcher":
+        sys.argv = ["tinytouch-prompt-watcher", *sys.argv[2:]]
+        from tinytouch_prompt_watcher import main as watcher_main  # type: ignore
+
+        return watcher_main()
     install_command_if_needed()
     args = parser().parse_args()
     VERBOSE = args.verbose
@@ -1531,11 +1733,16 @@ def main() -> int:
         "factory-reset", "delete", "bootloader",
     }
     helper_was_loaded = False
+    watcher_was_loaded = False
     try:
         show_startup_mark()
         if args.command in device_commands:
             reexec_in_environment_if_needed()
             helper_was_loaded = unload_helper()
+            # The prompt watcher holds the same serial port, so it has to step
+            # aside too or every device command fails on a busy port.
+            watcher_was_loaded = unload_watcher()
+            WATCHER_SUSPENDED = watcher_was_loaded
             HELPER_SUSPENDED = True
         args.func(args)
         return 0
@@ -1551,6 +1758,15 @@ def main() -> int:
                     load_helper()
                 except ToolError as exc:
                     print(f"tinytouch: HID background service could not restart: {exc}", file=sys.stderr)
+            WATCHER_SUSPENDED = False
+            if WATCHER_AGENT.exists() and watcher_was_loaded:
+                try:
+                    load_watcher()
+                except ToolError as exc:
+                    print(
+                        f"tinytouch: PIV prompt LED service could not restart: {exc}",
+                        file=sys.stderr,
+                    )
 
 
 if __name__ == "__main__":

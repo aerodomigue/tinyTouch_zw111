@@ -27,10 +27,15 @@
 #define TINYTOUCH_PROTOCOL_VERSION 1
 #endif
 
+// One LED state change per 250 ms. The effect commands share the sensor UART
+// with fingerprint polling, so an unthrottled caller would starve matching.
+#define LED_COMMAND_MIN_INTERVAL_US 250000
+
 static char command[640];
 static size_t command_len;
 static SemaphoreHandle_t cdc_write_mutex;
 static int64_t config_authorized_until;
+static int64_t led_command_allowed_at;
 
 typedef struct {
   uint8_t data[2400];
@@ -192,6 +197,25 @@ static void handle_command(void) {
   char line[192];
   if (strcmp(command, "PING") == 0) {
     send_line("PONG");
+  } else if (strncmp(command, "LED ", 4) == 0) {
+    // Deliberately not gated by CONFIG_UNLOCK: these commands only change the
+    // LED. They grant no authorization, do not touch PIV user presence, and
+    // cannot extend any authentication window. The rate limit exists so a noisy
+    // caller cannot monopolise the UART shared with fingerprint polling.
+    int64_t now = esp_timer_get_time();
+    if (now < led_command_allowed_at) {
+      send_line("ERR LED rate_limited");
+      return;
+    }
+    led_command_allowed_at = now + LED_COMMAND_MIN_INTERVAL_US;
+    if (strcmp(command + 4, "PROMPT") == 0) {
+      send_line(fingerprint_led_prompt() ? "OK LED PROMPT" : "ERR LED PROMPT");
+    } else if (strcmp(command + 4, "IDLE") == 0) {
+      fingerprint_led_idle();
+      send_line("OK LED IDLE");
+    } else {
+      send_line("ERR LED state");
+    }
   } else if (strcmp(command, "STATUS") == 0) {
     int count = fingerprint_count();
     if (count < 0) {
