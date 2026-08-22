@@ -64,9 +64,50 @@ were not exercised; A3 and A7 are expected to behave like A2 because they share
 | A5 screensaver | `loginwindow`: `-[ScreenSaverDaemon _screenSaverStart:]`, then the same `LWScreenLock` path | Default | 13.8 s |
 | A6 sleep → wake | `loginwindow`: `-[LWScreenLock startScreenLock:] \| entered kLWLockFromDisplayDim (5)`, plus `ctkahp`: `SmartCards inserted:` on wake | Default | 33 s |
 
-`-[LWScreenLock startScreenLock:]` is common to A4, A5 and A6, so three markers
-cover every measured case: `startScreenLock` for the screen, `Checked in app :
-SecurityAgent` for authorization dialogs, `Invoking SmartCard agent` for `sudo`.
+`-[LWScreenLock startScreenLock:]` is common to A4, A5 and A6.
+
+That marker alone is not enough, because it fires when the screen *locks*, not
+when someone walks back to it. Lock the Mac, come back ten minutes later, and
+the LED is long back to blue at the exact moment the hint is wanted. A fourth
+marker covers that: `loginwindow` logs
+
+```
+-[LWScreenLock startUnlock:] | entered newValue: kLWUnlockFromUserActive (9),
+                                       oldValue: kLWLockFromDisplayDim (5)
+```
+
+when the user becomes active again on a locked screen, including on wake from
+sleep. Beware of a decoy: a `startUnlock` also fires roughly 200 ms after every
+lock, carrying a `kLWLockFrom...` reason instead. Matching on
+`kLWUnlockFromUserActive` discriminates them; over 90 minutes it produced five
+occurrences, all real.
+
+So four markers cover every measured case: `startScreenLock` when the screen
+locks, `kLWUnlockFromUserActive` when the user returns to a locked screen,
+`Checked in app : SecurityAgent` for authorization dialogs, and
+`Invoking SmartCard agent` for `sudo`.
+
+A fifth marker closes the loop in the other direction. `loginwindow` logs
+SkyLight's `[ Display:Power ] Event: Did Sleep` when the display goes dark, which
+means nobody is standing there any more. Acting on it returns the LED to idle
+immediately instead of waiting out the firmware hold, and lets the LED follow the
+screen: locked with the display on is yellow, display off is blue, display on is
+yellow again. SkyLight is a client-side framework and dozens of processes log
+that line — over two hours, 36 occurrences across all processes but only 5 from
+`loginwindow`, which are the real display transitions.
+
+Order matters on wake. The card is de-powered during sleep, and the wake marker
+arrives about a second *before* the card finishes re-enumerating:
+
+```
+22:00:42.960  loginwindow  startUnlock ... kLWUnlockFromUserActive
+22:00:43.831  ctkahp       SmartCards inserted
+```
+
+A naive "ignore prompts while the card is absent" rule therefore drops precisely
+the prompt that matters most. The watcher remembers such a prompt and replays it
+when the card returns, within a short grace period so that merely plugging the
+device in later does not light it.
 
 ### Submission and result markers
 
@@ -202,10 +243,12 @@ change of domain for this one.
 ### Open design questions
 
 - **The lock screen is a persistent prompt.** Yellow breathing for the whole time
-  the machine is locked is wrong: it wastes power, wears the LED, and advertises
-  an armed device in an empty room. The prompt hold must be bounded, and re-armed
-  when the display wakes. The marker for display wake on an already-locked screen
-  has not been identified yet; `SmartCards inserted` covers the sleep case only.
+  the machine is locked would be wrong: it wastes power, wears the LED, and
+  advertises an armed device in an empty room. The hold is bounded at 30 s,
+  re-armed by `kLWUnlockFromUserActive` when someone returns to the screen, and
+  cleared by `Event: Did Sleep` when the display goes dark. The remaining gap is
+  small: if you sit in front of the lock screen for more than 30 s without
+  touching, the LED is blue again by then.
 - **`Checked in app : SecurityAgent` is not PIV-specific.** SecurityAgent also
   raises pure-password dialogs, which would light the LED for nothing. A touch
   during such a dialog is harmless, so the false positive is acceptable, but it

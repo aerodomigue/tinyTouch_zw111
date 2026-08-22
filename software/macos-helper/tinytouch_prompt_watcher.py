@@ -62,6 +62,11 @@ TICK_SECONDS = 0.05
 # relight the LED once the user is already through.
 RESULT_COOLDOWN_SECONDS = 3.0
 
+# How long a prompt that arrived while the card was away stays worth replaying
+# once it comes back. Long enough for USB re-enumeration after sleep, short
+# enough that simply plugging the device in later does not light it.
+MISSED_PROMPT_GRACE_SECONDS = 20.0
+
 PROMPT_COMMAND = "LED PROMPT"
 IDLE_COMMAND = "LED IDLE"
 
@@ -78,6 +83,21 @@ SUDO_PROMPT_MARKER = "Invoking SmartCard agent for uid"
 # `| entered` suffix isolates the single line that opens the sequence.
 SCREEN_LOCK_MARKER = "startScreenLock:] | entered"
 SECURITY_AGENT_MARKER = "Checked in app : SecurityAgent"
+
+# `startScreenLock` only fires when the screen locks. Someone who locks their
+# Mac and comes back later would find the LED long back to blue, which is
+# exactly when the hint is wanted. loginwindow logs this reason code when the
+# user becomes active again on an already-locked screen, including on wake from
+# sleep. A spurious `startUnlock` also fires about 200 ms after every lock, but
+# it carries a `kLWLockFrom...` reason instead of this one.
+SCREEN_WAKE_MARKER = "kLWUnlockFromUserActive"
+
+# The display going dark ends the prompt: nobody is standing there any more.
+# Pairing it with the wake marker lets the LED cycle with the screen instead of
+# relying on the firmware hold to time out. SkyLight is a client-side framework
+# so many processes log this line; restricting it to loginwindow leaves only the
+# real display transitions.
+DISPLAY_SLEEP_MARKER = "Event: Did Sleep"
 
 RESULT_MARKER = "Token login result"
 
@@ -100,6 +120,8 @@ PREDICATE = (
     f'eventMessage CONTAINS "{CARD_INSERTED_MARKER}")) OR '
     f'(process == "{LOGIN_PROCESS}" AND ('
     f'eventMessage CONTAINS "{SCREEN_LOCK_MARKER}" OR '
+    f'eventMessage CONTAINS "{SCREEN_WAKE_MARKER}" OR '
+    f'eventMessage CONTAINS "{DISPLAY_SLEEP_MARKER}" OR '
     f'eventMessage CONTAINS "{SECURITY_AGENT_MARKER}"))'
 )
 
@@ -108,6 +130,7 @@ class EventKind(Enum):
     """Kinds of authentication event recognised in the unified log."""
 
     PROMPT_OPENED = "prompt_opened"
+    DISPLAY_OFF = "display_off"
     PIN_SUBMITTED = "pin_submitted"
     RESULT = "result"
     CARD_REMOVED = "card_removed"
@@ -238,6 +261,10 @@ def parse_log_line(line: str) -> PromptEvent | None:
         return PromptEvent(EventKind.PROMPT_OPENED, "pam_smartcard")
     if process == LOGIN_PROCESS and SCREEN_LOCK_MARKER in message:
         return PromptEvent(EventKind.PROMPT_OPENED, "screen_lock")
+    if process == LOGIN_PROCESS and SCREEN_WAKE_MARKER in message:
+        return PromptEvent(EventKind.PROMPT_OPENED, "screen_wake")
+    if process == LOGIN_PROCESS and DISPLAY_SLEEP_MARKER in message:
+        return PromptEvent(EventKind.DISPLAY_OFF, "display_sleep")
     if process == LOGIN_PROCESS and SECURITY_AGENT_MARKER in message:
         return PromptEvent(EventKind.PROMPT_OPENED, "security_agent")
     return None
@@ -379,6 +406,7 @@ class PromptWatcher:
         self._pending_prompt_at = 0.0
         self._pending_source = ""
         self._cooldown_until = 0.0
+        self._prompt_missed_at = 0.0
 
     def handle(self, event: PromptEvent) -> None:
         """React to one event.
@@ -395,6 +423,24 @@ class PromptWatcher:
         if event.kind is EventKind.CARD_INSERTED:
             self._card_present = True
             LOGGER.info("card inserted")
+            missed = self._prompt_missed_at
+            self._prompt_missed_at = 0.0
+            if missed and time.monotonic() - missed <= MISSED_PROMPT_GRACE_SECONDS:
+                # Waking from sleep raises the prompt about a second before the
+                # card finishes re-enumerating. Now that it is back, honour it.
+                LOGGER.info("replaying prompt that arrived while the card was away")
+                self._pending_prompt_at = time.monotonic() + PROMPT_DEFER_SECONDS
+                self._pending_source = "screen_wake"
+            return
+
+        if event.kind is EventKind.DISPLAY_OFF:
+            # Nobody is in front of the machine any more, so drop the prompt
+            # rather than waiting for the firmware hold to run out. Waking the
+            # display raises it again.
+            LOGGER.info("display off")
+            self._cancel_pending()
+            self._prompt_missed_at = 0.0
+            self._leds.send(IDLE_COMMAND)
             return
 
         if event.kind is EventKind.PIN_SUBMITTED:
@@ -414,8 +460,10 @@ class PromptWatcher:
         now = time.monotonic()
         if not self._card_present:
             # The device is still re-enumerating after sleep. Claiming readiness
-            # here would be a lie: no touch can succeed yet.
-            LOGGER.debug("prompt from %s ignored, card absent", event.source)
+            # here would be a lie, so remember it and raise it once the card is
+            # back instead of dropping it.
+            LOGGER.debug("prompt from %s deferred, card absent", event.source)
+            self._prompt_missed_at = now
             return
         if now < self._cooldown_until:
             LOGGER.debug("prompt from %s ignored, result cooldown", event.source)
